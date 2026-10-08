@@ -183,7 +183,8 @@ fn signature(health: &Value) -> String {
 }
 
 fn servers_reply(net: ZNetwork, cfg: &NetConfig) -> String {
-    reply::ok(json!({"network": net.name(), "preset": cfg.preset, "servers": cfg.servers}))
+    reply::ok(json!({"network": net.name(), "preset": cfg.preset, "servers": cfg.servers,
+                     "proxy": cfg.proxy, "proxyRequired": cfg.proxy_required}))
 }
 
 impl Node {
