@@ -32,13 +32,16 @@ pub struct NetConfig {
     /// By server id.
     #[serde(default)]
     pub suspects: BTreeMap<String, Suspicion>,
+    /// Reads go to the local node (zebrad_module) over IPC; broadcasts stay on the servers.
+    #[serde(default)]
+    pub local_node: bool,
 }
 
 impl NetConfig {
     pub fn seeded(net: ZNetwork) -> Self {
         // Regtest has no presets and no default proxy: the test harness sets both.
         if net == ZNetwork::Regtest {
-            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new() };
+            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new(), local_node: false };
         }
         Self {
             preset: Preset::TwoOperators,
@@ -46,6 +49,7 @@ impl NetConfig {
             proxy: Some(DEFAULT_PROXY.into()),
             proxy_required: true,
             suspects: BTreeMap::new(),
+            local_node: false,
         }
     }
 

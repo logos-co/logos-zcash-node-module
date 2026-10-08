@@ -14,7 +14,7 @@ use crate::health::{self, Row, ServerHealth};
 use crate::network::{networks, ZNetwork};
 use crate::proxy;
 use crate::reply;
-use crate::servers::{self, preset_servers, Preset, Route, Server, Source, MAX_SERVERS};
+use crate::servers::{self, preset_servers, CallClass, Preset, Route, Server, Source, MAX_SERVERS};
 use crate::store::{NetConfig, Store, Suspicion};
 
 pub const NO_PROXY: &str = "no proxy is set";
@@ -41,6 +41,7 @@ pub struct Node {
     path: Option<PathBuf>,
     sink: Sink,
     wake: Notify,
+    local: Mutex<Option<Arc<dyn LocalStatus>>>,
 }
 
 struct Inner {
@@ -94,14 +95,17 @@ impl Inner {
         self.health.retain(|(n, id), (url, _)| *n != net || live.iter().any(|(i, u)| i == id && u == url));
     }
 
-    /// Fail closed: without a proxy there is no route at all.
+    /// Fail closed: without a proxy there is no route to a server at all.
     fn route_table(&self, net: ZNetwork) -> String {
         let cfg = self.cfg(net);
-        let Some(proxy) = cfg.proxy.as_deref() else { return reply::err(NO_PROXY) };
         let usable = |s: &Server| {
             !cfg.suspects.contains_key(&s.id) && !self.health_of(net, s).is_some_and(|h| h.incompatible)
         };
         let r = servers::routes(&cfg.servers, usable);
+        if cfg.local_node {
+            return self.local_route_table(net, cfg, r.broadcast);
+        }
+        let Some(proxy) = cfg.proxy.as_deref() else { return reply::err(NO_PROXY) };
         let table = RouteTable {
             ok: true,
             network: net.name(),
@@ -114,6 +118,36 @@ impl Inner {
             broadcast: r.broadcast,
             mempool: r.mempool,
             tip: r.tip,
+        };
+        serde_json::to_string(&table).unwrap_or_else(reply::err)
+    }
+
+    /// Every read from the local node, which checks the chain itself, so nothing is cross-checked.
+    /// Broadcasts stay on the servers over Tor, even when none is usable right now; only a user
+    /// with no server enabled at all has the node send them itself.
+    fn local_route_table(&self, net: ZNetwork, cfg: &NetConfig, remote: Vec<Route>) -> String {
+        let local = vec![Route { id: "local".into(), url: LOCAL_NODE_URL.into(), operator: "local".into() }];
+        let any_enabled = cfg.servers.iter().any(|s| s.enabled && s.classes.contains(&CallClass::Broadcast));
+        let (broadcast, proxy) = if !any_enabled {
+            (local.clone(), "")
+        } else {
+            match cfg.proxy.as_deref() {
+                Some(p) => (remote, p),
+                None => return reply::err(NO_PROXY),
+            }
+        };
+        let table = RouteTable {
+            ok: true,
+            network: net.name(),
+            proxy,
+            proxy_required: cfg.proxy_required && !proxy.is_empty(),
+            cross_check: false,
+            sync: local.clone(),
+            details: local.clone(),
+            taddr: local.clone(),
+            broadcast,
+            mempool: local.clone(),
+            tip: local,
         };
         serde_json::to_string(&table).unwrap_or_else(reply::err)
     }
@@ -184,7 +218,15 @@ fn signature(health: &Value) -> String {
 
 fn servers_reply(net: ZNetwork, cfg: &NetConfig) -> String {
     reply::ok(json!({"network": net.name(), "preset": cfg.preset, "servers": cfg.servers,
-                     "proxy": cfg.proxy, "proxyRequired": cfg.proxy_required}))
+                     "proxy": cfg.proxy, "proxyRequired": cfg.proxy_required, "localNode": cfg.local_node}))
+}
+
+/// The route the wallet core reaches the local node by, over Logos IPC.
+pub const LOCAL_NODE_URL: &str = "logos://zebrad_module";
+
+/// zebrad_module's status, when it is loaded. A trait so the pure tests can stand one in.
+pub trait LocalStatus: Send + Sync {
+    fn status(&self) -> Result<Value, String>;
 }
 
 impl Node {
@@ -198,7 +240,7 @@ impl Node {
         for net in networks() {
             let _ = inner.changes(net);
         }
-        Arc::new(Self { inner: Mutex::new(inner), path, sink, wake: Notify::new() })
+        Arc::new(Self { inner: Mutex::new(inner), path, sink, wake: Notify::new(), local: Mutex::new(None) })
     }
 
     /// Notified when the servers or the proxy change, so the poller looks at once.
@@ -344,11 +386,36 @@ impl Node {
         })
     }
 
-    /// No local node exists yet (stage 2).
+    /// Installed by the glue when zebrad_module is a dependency.
+    pub fn set_local_status(&self, s: Arc<dyn LocalStatus>) {
+        *self.local.lock().unwrap() = Some(s);
+    }
+
+    pub fn set_local_node(&self, network: &str, enabled: bool) -> String {
+        let Some(net) = ZNetwork::parse(network) else { return bad_network() };
+        self.mutate(net, false, |cfg| {
+            cfg.local_node = enabled;
+            Ok((reply::ok(json!({"network": net.name(), "localNode": enabled})), vec![]))
+        })
+    }
+
+    /// `{ ok, enabled, available, status? , error? }`: whether reads go to the local node, and
+    /// whether zebrad_module runs it for `network` now.
     pub fn local_node(&self, network: &str) -> String {
-        match ZNetwork::parse(network) {
-            Some(_) => reply::ok(json!({"available": false})),
-            None => bad_network(),
+        let Some(net) = ZNetwork::parse(network) else { return bad_network() };
+        let enabled = self.lock().cfg(net).local_node;
+        let source = self.local.lock().unwrap().clone();
+        let Some(source) = source else {
+            return reply::ok(json!({"enabled": enabled, "available": false, "error": "zebrad_module is not installed"}));
+        };
+        match source.status() {
+            Ok(st) => {
+                // zebrad_module may name the network as Zebra does ("Testnet").
+                let on_net = st["network"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(net.name()));
+                let available = st["state"] == "running" && on_net;
+                reply::ok(json!({"enabled": enabled, "available": available, "status": st}))
+            }
+            Err(e) => reply::ok(json!({"enabled": enabled, "available": false, "error": e})),
         }
     }
 
@@ -440,6 +507,41 @@ mod tests {
 
     fn ids(v: &Value, class: &str) -> Vec<String> {
         v[class].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    struct FakeLocal(Value);
+
+    impl LocalStatus for FakeLocal {
+        fn status(&self) -> Result<Value, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn local_node_takes_every_read_and_broadcasts_stay_on_tor() {
+        let h = harness();
+        assert_eq!(v(h.node.local_node("testnet"))["error"], "zebrad_module is not installed");
+        h.take();
+        assert_eq!(v(h.node.set_local_node("testnet", true))["localNode"], true);
+        assert_eq!(h.take(), vec!["routes testnet"]);
+        let rt = v(h.node.route_table("testnet"));
+        for class in ["sync", "details", "taddr", "mempool", "tip"] {
+            assert_eq!(rt[class][0]["url"], LOCAL_NODE_URL, "{class}");
+        }
+        assert_eq!((ids(&rt, "broadcast"), &rt["crossCheck"], &rt["proxy"]), (vec!["testnet.zec.rocks".to_string()], &json!(false), &json!("socks5h://127.0.0.1:9050")));
+        assert_eq!(v(h.node.servers("testnet"))["localNode"], true);
+        // A suspect server leaves no broadcast route; the local node does not quietly take over.
+        h.node.report_mismatch("testnet", "testnet.zec.rocks", "tip", 1);
+        assert_eq!(v(h.node.route_table("testnet"))["broadcast"], json!([]));
+        // Status comes from zebrad_module; it must run this network to be available.
+        h.node.set_local_status(Arc::new(FakeLocal(json!({"state": "running", "network": "Testnet", "height": 10}))));
+        let st = v(h.node.local_node("testnet"));
+        assert_eq!((&st["enabled"], &st["available"], &st["status"]["height"]), (&json!(true), &json!(true), &json!(10)));
+        assert_eq!(v(h.node.local_node("mainnet"))["available"], false);
+        // Off again: the servers take every class back.
+        h.node.set_local_node("testnet", false);
+        h.node.clear_suspect("testnet", "testnet.zec.rocks");
+        assert_eq!(ids(&v(h.node.route_table("testnet")), "sync"), vec!["testnet.zec.rocks".to_string()]);
     }
 
     fn answer(net: ZNetwork, chain: &str, branch: &str, tip: u64) -> ServerHealth {
@@ -637,6 +739,6 @@ mod tests {
         }
         assert_eq!(v(again.server_health("mainnet"))["servers"][0]["suspect"], true);
         assert_eq!(v(again.route_table("testnet"))["proxy"], "socks5h://127.0.0.1:19050");
-        assert_eq!(again.local_node("testnet"), r#"{"ok":true,"available":false}"#);
+        assert_eq!(v(again.local_node("testnet"))["available"], false);
     }
 }
