@@ -142,7 +142,7 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
             Event::Suspect { network, server_id, kind } => emit_server_suspect(network.name(), &server_id, &kind),
         });
         let node = Node::open(Some(dir.join(FILE_NAME)), sink);
-        node.set_local_status(Arc::new(ZebradStatus));
+        node.set_local_status(Arc::new(ZebradStatus::default()));
         if self.node.set(node.clone()).is_ok() {
             match Poller::start(node) {
                 Ok(p) => *self.poller.lock().unwrap() = Some(p),
@@ -153,14 +153,17 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
 }
 
 /// zebrad_module, an OPTIONAL dependency: when it is not loaded, local_node() says so.
-struct ZebradStatus;
+/// The client is made on first use and kept: each new one opens its own connection.
+#[derive(Default)]
+struct ZebradStatus(std::sync::OnceLock<zebrad_module::ZebradModuleClient>);
 
 /// Bounded so an absent zebrad_module costs 1.5 s, not the protocol deadline.
 const LOCAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl crate::node::LocalStatus for ZebradStatus {
     fn status(&self) -> Result<serde_json::Value, String> {
-        zebrad_module::ZebradModuleClient::new()
+        self.0
+            .get_or_init(zebrad_module::ZebradModuleClient::new)
             .status_with_timeout(LOCAL_BUDGET)
             .map(|m| serde_json::Value::Object(m.into_iter().collect()))
             .map_err(|e| {
