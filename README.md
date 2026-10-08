@@ -20,6 +20,15 @@ The other zec.rocks and Stardust hosts stay in the list, disabled, as failover c
 `taddr`, `broadcast`, `mempool` and `tip`, plus the proxy and `crossCheck`, true when a second
 operator is enabled. Each route is `{ id, url, operator }`.
 
+## Regtest (test harnesses)
+
+A `regtest.json` in the instance persistence directory adds a local `regtest` network. It
+holds upgrade heights in the wallet core's format, e.g.
+`{"overwinter":1,"sapling":1,"blossom":1,"heartwood":1,"canopy":1,"nu5":1,"nu6":1,"nu6_1":1,"nu6_2":1,"nu6_3":300,"nu7":null}`.
+Regtest has no presets and starts with no servers and no proxy. It alone takes
+`http://127.0.0.1:PORT` servers and the proxy `direct`: plain gRPC to that loopback
+lightwalletd, without Tor.
+
 ## Callers
 
 Only `zcash_wallet_backend` may change the list, the preset or the proxy, or clear a suspect

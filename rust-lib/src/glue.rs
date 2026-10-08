@@ -16,11 +16,13 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// `{ ok, network, preset, servers: [{ id, url, operator, label, enabled, classes, source }] }`.
     fn servers(&self, network: String) -> String;
     /// Replaces the list with a JSON array of servers (https only, unique ids, one
-    /// enabled at least); the preset becomes `custom`. Backend only.
+    /// enabled at least); the preset becomes `custom`. Regtest also takes
+    /// `http://127.0.0.1:port`, and an empty list. Backend only.
     fn set_servers(&self, network: String, list_json: String) -> String;
-    /// `two-operators`, `single` or `custom`. Backend only.
+    /// `two-operators`, `single` or `custom`; regtest has none. Backend only.
     fn apply_preset(&self, network: String, name: String) -> String;
-    /// `{ proxy, proxyRequired }`; the proxy must be socks5h://host:port. Backend only.
+    /// `{ proxy, proxyRequired }`; the proxy must be socks5h://host:port, or `direct` on
+    /// regtest. Backend only.
     fn set_proxy(&self, network: String, config_json: String) -> String;
     /// `{ ok, network, proxy, proxyRequired, crossCheck, sync, details, taddr, broadcast,
     /// mempool, tip }`, each class a list of `{ id, url, operator }`. Backend and wallet core.
@@ -119,6 +121,13 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();
         *self.callers.lock().unwrap() = Callers::from_file(callers.as_deref());
+        // A local test chain's upgrade heights, for test harnesses only.
+        if let Some(h) = std::fs::read_to_string(dir.join("regtest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<crate::network::RegtestHeights>(&t).ok())
+        {
+            crate::network::configure_regtest(&h);
+        }
         let sink: Sink = Arc::new(|ev| match ev {
             Event::HealthChanged { network, payload } => emit_server_health_changed(network.name(), &payload),
             Event::RoutesChanged { network } => emit_routes_changed(network.name()),

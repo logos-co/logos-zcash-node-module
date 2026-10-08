@@ -87,6 +87,7 @@ fn hosts(net: ZNetwork) -> &'static [Host] {
     match net {
         ZNetwork::Mainnet => MAINNET,
         ZNetwork::Testnet => TESTNET,
+        ZNetwork::Regtest => &[],
     }
 }
 
@@ -162,7 +163,7 @@ pub fn parse_list(net: ZNetwork, json: &str) -> Result<Vec<Server>, String> {
             return Err("server list: every entry must be a JSON object".into());
         }
         let s: ServerInput = serde_json::from_value(item).map_err(|e| format!("server list: {e}"))?;
-        let url = normalize_url(&s.url)?;
+        let url = normalize_url(net, &s.url)?;
         let operator = s.operator.trim().to_string();
         let mut classes = s.classes.unwrap_or_else(|| ALL_CLASSES.to_vec());
         classes.sort();
@@ -174,12 +175,16 @@ pub fn parse_list(net: ZNetwork, json: &str) -> Result<Vec<Server>, String> {
         let source = if is_preset_entry(net, &s.id, &url, &operator) { Source::Preset } else { Source::User };
         out.push(Server { id: s.id, url, operator, label, enabled: s.enabled, classes, source });
     }
-    validate(&out)?;
+    validate(net, &out)?;
     Ok(out)
 }
 
-/// The rules every stored list obeys, whoever wrote it.
-pub fn validate(list: &[Server]) -> Result<(), String> {
+/// The rules every stored list obeys, whoever wrote it. Regtest has no presets, so its
+/// list may be empty.
+pub fn validate(net: ZNetwork, list: &[Server]) -> Result<(), String> {
+    if net == ZNetwork::Regtest && list.is_empty() {
+        return Ok(());
+    }
     if list.is_empty() || list.len() > MAX_SERVERS {
         return Err(format!("a list holds 1 to {MAX_SERVERS} servers"));
     }
@@ -192,7 +197,7 @@ pub fn validate(list: &[Server]) -> Result<(), String> {
         if !ids.insert(s.id.as_str()) {
             return Err(format!("duplicate server id {}", s.id));
         }
-        match normalize_url(&s.url) {
+        match normalize_url(net, &s.url) {
             Ok(n) if n == s.url => {}
             Ok(n) => return Err(format!("{}: url must be written as {n}", s.id)),
             Err(e) => return Err(format!("{}: {e}", s.id)),
@@ -216,11 +221,13 @@ pub fn validate(list: &[Server]) -> Result<(), String> {
     Ok(())
 }
 
-/// `https://host:port`, lowercase host, port 443 when absent. Anything else is refused.
-pub fn normalize_url(url: &str) -> Result<String, String> {
+/// `https://host:port`, lowercase host, port 443 when absent; on regtest also a loopback
+/// lightwalletd as `http://127.0.0.1:port`. Anything else is refused.
+pub fn normalize_url(net: ZNetwork, url: &str) -> Result<String, String> {
     let bad = || format!("{url}: url must be https://host:port");
     let uri: Uri = url.trim().parse().map_err(|_| bad())?;
-    if !uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https")) {
+    let http = net == ZNetwork::Regtest && uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("http"));
+    if !http && !uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https")) {
         return Err(format!("{url}: only https servers are allowed"));
     }
     let authority = uri.authority().ok_or_else(bad)?;
@@ -234,6 +241,13 @@ pub fn normalize_url(url: &str) -> Result<String, String> {
     let port = authority.port_u16().unwrap_or(443);
     if port == 0 {
         return Err(bad());
+    }
+    if http {
+        // The wallet core takes plain http only from this exact prefix.
+        return match (host.as_str(), authority.port_u16()) {
+            ("127.0.0.1", Some(port)) => Ok(format!("http://127.0.0.1:{port}")),
+            _ => Err(format!("{url}: plain http is only for a loopback server, http://127.0.0.1:port")),
+        };
     }
     Ok(format!("https://{host}:{port}"))
 }
@@ -318,7 +332,7 @@ mod tests {
     #[test]
     fn mainnet_two_operators() {
         let list = preset_servers(ZNetwork::Mainnet, Preset::TwoOperators).unwrap();
-        validate(&list).unwrap();
+        validate(ZNetwork::Mainnet, &list).unwrap();
         assert_eq!(list.len(), 7);
         let enabled: Vec<&str> = list.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect();
         assert_eq!(enabled, ["zec.rocks", "us.zec.stardust.rest"]);
@@ -421,5 +435,27 @@ mod tests {
             let e = parse_list(ZNetwork::Mainnet, bad).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn loopback_http_only_on_regtest() {
+        assert_eq!(normalize_url(ZNetwork::Regtest, " HTTP://127.0.0.1:29061/ ").unwrap(), "http://127.0.0.1:29061");
+        assert_eq!(normalize_url(ZNetwork::Regtest, "https://A.example").unwrap(), "https://a.example:443");
+        for net in [ZNetwork::Mainnet, ZNetwork::Testnet] {
+            assert!(normalize_url(net, "http://127.0.0.1:29061").unwrap_err().contains("only https"));
+            assert!(parse_list(net, "[]").is_err());
+        }
+        for url in ["http://10.0.0.1:9067", "http://localhost:9067", "http://[::1]:9067", "http://127.0.0.2:9067", "http://127.0.0.1"] {
+            assert!(normalize_url(ZNetwork::Regtest, url).unwrap_err().contains("http://127.0.0.1:port"), "{url}");
+        }
+        assert!(normalize_url(ZNetwork::Regtest, "http://127.0.0.1:0").is_err());
+
+        // Regtest has no presets: its list starts, and may stay, empty.
+        assert!(preset_servers(ZNetwork::Regtest, Preset::TwoOperators).unwrap().is_empty());
+        assert!(parse_list(ZNetwork::Regtest, "[]").unwrap().is_empty());
+        let list = parse_list(ZNetwork::Regtest, r#"[{"id":"lwd1","url":"http://127.0.0.1:29061","operator":"local"}]"#).unwrap();
+        assert_eq!((list[0].source, list[0].label.as_str()), (Source::User, "127.0.0.1"));
+        assert!(validate(ZNetwork::Regtest, &list).is_ok() && validate(ZNetwork::Testnet, &list).is_err());
+        assert_eq!(routes(&list, all).sync[0].url, "http://127.0.0.1:29061");
     }
 }

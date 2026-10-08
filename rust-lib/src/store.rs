@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::network::{ZNetwork, NETWORKS};
+use crate::network::{networks, ZNetwork};
 use crate::proxy::{self, DEFAULT_PROXY};
 use crate::servers::{self, preset_servers, Preset, Server};
 
@@ -36,6 +36,10 @@ pub struct NetConfig {
 
 impl NetConfig {
     pub fn seeded(net: ZNetwork) -> Self {
+        // Regtest has no presets and no default proxy: the test harness sets both.
+        if net == ZNetwork::Regtest {
+            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new() };
+        }
         Self {
             preset: Preset::TwoOperators,
             servers: preset_servers(net, Preset::TwoOperators).unwrap_or_default(),
@@ -59,10 +63,10 @@ impl NetConfig {
         self.suspects.retain(|id, _| same(id));
     }
 
-    pub fn validate(&self) -> Result<(), String> {
-        servers::validate(&self.servers)?;
+    pub fn validate(&self, net: ZNetwork) -> Result<(), String> {
+        servers::validate(net, &self.servers)?;
         if let Some(p) = &self.proxy {
-            if proxy::normalize(p)? != *p {
+            if proxy::normalize(net, p)? != *p {
                 return Err(format!("proxy {p} is not normalized"));
             }
         }
@@ -88,10 +92,11 @@ pub enum Loaded {
 
 impl Store {
     pub fn seeded() -> Self {
-        Self { version: VERSION, networks: NETWORKS.iter().map(|n| (*n, NetConfig::seeded(*n))).collect() }
+        Self { version: VERSION, networks: networks().into_iter().map(|n| (n, NetConfig::seeded(n))).collect() }
     }
 
-    /// Reads the file; a network missing from it gets its presets.
+    /// Reads the file; a network missing from it gets its presets, and regtest is
+    /// dropped unless it is configured.
     pub fn load(path: &Path) -> Loaded {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -105,12 +110,14 @@ impl Store {
         if store.version != VERSION {
             return Loaded::Corrupt(format!("unknown version {}", store.version));
         }
+        let kept = networks();
+        store.networks.retain(|net, _| kept.contains(net));
         for (net, cfg) in &store.networks {
-            if let Err(e) = cfg.validate() {
+            if let Err(e) = cfg.validate(*net) {
                 return Loaded::Corrupt(format!("{}: {e}", net.name()));
             }
         }
-        for net in NETWORKS {
+        for net in kept {
             store.networks.entry(net).or_insert_with(|| NetConfig::seeded(net));
         }
         Loaded::Found(store)
@@ -225,6 +232,23 @@ mod tests {
         assert_eq!(Store::load_or_seed(&path), Store::seeded());
         assert_eq!(std::fs::read_to_string(corrupt_path(&path)).unwrap(), "{ not json");
         assert!(matches!(Store::load(&path), Loaded::Found(_)));
+    }
+
+    #[test]
+    fn regtest_is_dropped_unless_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let mut store = Store::seeded();
+        let regtest = NetConfig { proxy: Some(proxy::DIRECT.into()), ..NetConfig::seeded(ZNetwork::Regtest) };
+        regtest.validate(ZNetwork::Regtest).unwrap();
+        store.networks.insert(ZNetwork::Regtest, regtest);
+        store.save(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"regtest\""));
+        // No unit test configures regtest, so the entry is left out, not taken as corrupt.
+        match Store::load(&path) {
+            Loaded::Found(s) => assert_eq!(s, Store::seeded()),
+            _ => panic!("expected a store"),
+        }
     }
 
     #[test]

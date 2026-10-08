@@ -26,6 +26,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 /// circuit `isolation` selects. Only https URLs are accepted.
 pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
     let uri: Uri = server.parse().map_err(|_| NetError::BadUrl(server.into()))?;
+    if proxy.is_direct() {
+        // Regtest only: plaintext to a loopback lightwalletd, never anywhere else.
+        let loopback = matches!(uri.host(), Some("127.0.0.1" | "localhost" | "[::1]" | "::1"));
+        if uri.scheme_str() != Some("http") || !loopback {
+            return Err(NetError::BadUrl(server.into()));
+        }
+        let channel = Endpoint::from_shared(server.to_string())
+            .map_err(|source| NetError::Connect { server: server.into(), source })?
+            .connect()
+            .await
+            .map_err(|source| NetError::Connect { server: server.into(), source })?;
+        return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
+    }
     if uri.scheme_str() != Some("https") {
         return Err(NetError::BadUrl(server.into()));
     }
@@ -47,6 +60,17 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
 mod tests {
     use super::*;
     use zcash_client_backend::proto::service::Empty;
+
+    #[tokio::test]
+    async fn direct_is_plain_http_to_loopback_only() {
+        let direct = ProxyAddr::direct();
+        for url in ["https://127.0.0.1:9067", "http://10.0.0.1:9067", "http://zec.rocks:443"] {
+            assert!(matches!(connect(url, &direct, Isolation::fresh()).await, Err(NetError::BadUrl(_))), "{url}");
+        }
+        // Through a proxy, plain http is refused before anything is dialled.
+        let tor = ProxyAddr::parse("socks5h://127.0.0.1:9050").unwrap();
+        assert!(matches!(connect("http://127.0.0.1:9067", &tor, Isolation::fresh()).await, Err(NetError::BadUrl(_))));
+    }
 
     /// Needs a Tor SOCKS port in ZCASH_TEST_TOR, e.g. socks5h://127.0.0.1:19050.
     #[tokio::test]
