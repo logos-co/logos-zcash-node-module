@@ -14,7 +14,9 @@
     let
       nixpkgs = logos-module-builder.inputs.nixpkgs;
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+      # x86_64-windows is a cross build from x86_64-linux.
+      targets = systems ++ [ "x86_64-windows" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs targets f;
     in
     {
       packages = forAllSystems (system:
