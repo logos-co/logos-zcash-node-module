@@ -34,8 +34,12 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     fn report_mismatch(&self, network: String, server_id: String, kind: String, height: i64) -> String;
     /// `{ ok, network, serverId, cleared }`. Backend only.
     fn clear_suspect(&self, network: String, server_id: String) -> String;
-    /// `{ ok, available }`: no local node yet.
+    /// `{ ok, enabled, available, status?, error? }`: whether reads go to the local node, and
+    /// whether zebrad_module runs it for `network`; `status` is its status().
     fn local_node(&self, network: String) -> String;
+    /// Reads from the local node over IPC, broadcasts over Tor. `{ ok, network, localNode }`.
+    /// Backend only.
+    fn set_local_node(&self, network: String, enabled: bool) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -116,6 +120,10 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         self.gated(Access::Open, |n| n.local_node(&network))
     }
 
+    fn set_local_node(&self, network: String, enabled: bool) -> String {
+        self.gated(Access::Backend, |n| n.set_local_node(&network, enabled))
+    }
+
     /// Loads the servers and starts the health thread; the thread makes the calls.
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
@@ -134,12 +142,28 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
             Event::Suspect { network, server_id, kind } => emit_server_suspect(network.name(), &server_id, &kind),
         });
         let node = Node::open(Some(dir.join(FILE_NAME)), sink);
+        node.set_local_status(Arc::new(ZebradStatus));
         if self.node.set(node.clone()).is_ok() {
             match Poller::start(node) {
                 Ok(p) => *self.poller.lock().unwrap() = Some(p),
                 Err(e) => eprintln!("zcash_node_module: health thread: {e}"),
             }
         }
+    }
+}
+
+/// zebrad_module, an OPTIONAL dependency: when it is not loaded, local_node() says so.
+struct ZebradStatus;
+
+/// Bounded so an absent zebrad_module costs 1.5 s, not the protocol deadline.
+const LOCAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+impl crate::node::LocalStatus for ZebradStatus {
+    fn status(&self) -> Result<serde_json::Value, String> {
+        zebrad_module::ZebradModuleClient::new().status_with_timeout(LOCAL_BUDGET).map_err(|e| {
+            let s = e.to_string();
+            if s.contains("object_unavailable") { "zebrad_module is not loaded".into() } else { format!("zebrad_module: {s}") }
+        })
     }
 }
 
