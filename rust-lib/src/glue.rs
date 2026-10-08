@@ -160,10 +160,13 @@ const LOCAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500)
 
 impl crate::node::LocalStatus for ZebradStatus {
     fn status(&self) -> Result<serde_json::Value, String> {
-        zebrad_module::ZebradModuleClient::new().status_with_timeout(LOCAL_BUDGET).map_err(|e| {
-            let s = e.to_string();
-            if s.contains("object_unavailable") { "zebrad_module is not loaded".into() } else { format!("zebrad_module: {s}") }
-        })
+        zebrad_module::ZebradModuleClient::new()
+            .status_with_timeout(LOCAL_BUDGET)
+            .map(|m| serde_json::Value::Object(m.into_iter().collect()))
+            .map_err(|e| {
+                let s = e.to_string();
+                if s.contains("object_unavailable") { "zebrad_module is not loaded".into() } else { format!("zebrad_module: {s}") }
+            })
     }
 }
 
