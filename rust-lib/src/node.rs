@@ -410,7 +410,9 @@ impl Node {
         };
         match source.status() {
             Ok(st) => {
-                let available = st["state"] == "running" && st["network"] == net.name();
+                // zebrad_module may name the network as Zebra does ("Testnet").
+                let on_net = st["network"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(net.name()));
+                let available = st["state"] == "running" && on_net;
                 reply::ok(json!({"enabled": enabled, "available": available, "status": st}))
             }
             Err(e) => reply::ok(json!({"enabled": enabled, "available": false, "error": e})),
@@ -532,7 +534,7 @@ mod tests {
         h.node.report_mismatch("testnet", "testnet.zec.rocks", "tip", 1);
         assert_eq!(v(h.node.route_table("testnet"))["broadcast"], json!([]));
         // Status comes from zebrad_module; it must run this network to be available.
-        h.node.set_local_status(Arc::new(FakeLocal(json!({"state": "running", "network": "testnet", "height": 10}))));
+        h.node.set_local_status(Arc::new(FakeLocal(json!({"state": "running", "network": "Testnet", "height": 10}))));
         let st = v(h.node.local_node("testnet"));
         assert_eq!((&st["enabled"], &st["available"], &st["status"]["height"]), (&json!(true), &json!(true), &json!(10)));
         assert_eq!(v(h.node.local_node("mainnet"))["available"], false);
