@@ -58,6 +58,7 @@ fn every_preset_host_answers() {
         }
     }
     assert!(answered.contains(&(ZNetwork::Testnet, "zec.rocks".into())), "testnet.zec.rocks");
+    assert!(answered.contains(&(ZNetwork::Testnet, "logos".into())), "our testnet onion server");
     for op in ["zec.rocks", "stardust"] {
         assert!(answered.contains(&(ZNetwork::Mainnet, op.into())), "no mainnet {op} host answered");
     }
