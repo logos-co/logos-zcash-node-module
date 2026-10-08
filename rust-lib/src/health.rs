@@ -51,7 +51,7 @@ impl ServerHealth {
     }
 
     /// Applies the per-server rules: a wrong chain is unreachable; an old protocol
-    /// or a garbled branch ID is reachable but not routable.
+    /// or a garbled branch ID is reachable but not routable. Regtest also takes Zebra's "test".
     pub fn observed(net: ZNetwork, o: Observed, now: u64) -> Self {
         let mut h = Self {
             reachable: true,
@@ -67,7 +67,7 @@ impl ServerHealth {
             info_height: Some(o.info_height),
             incompatible: false,
         };
-        let problem = if h.chain.as_deref() != Some(net.lightd_chain_name()) {
+        let problem = if !h.chain.as_deref().is_some_and(|c| net.accepts_lightd_chain(c)) {
             h.reachable = false;
             Some(WRONG_CHAIN)
         } else if !protocol_at_least(h.protocol_version.as_deref().unwrap_or(""), MIN_PROTOCOL) {

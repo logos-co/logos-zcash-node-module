@@ -1,7 +1,10 @@
 //! The networks this module keeps servers for, as consensus parameters.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 use zcash_protocol::consensus::{self, BlockHeight, BranchId, NetworkType, NetworkUpgrade, Parameters};
+use zcash_protocol::local_consensus::LocalNetwork;
 
 /// NU7's mainnet height, set with the wallet core's override of the same name, so
 /// both expect the same branch IDs.
@@ -12,22 +15,78 @@ pub const MAINNET_NU7_OVERRIDE: Option<u32> = None;
 pub enum ZNetwork {
     Mainnet,
     Testnet,
+    /// A local test chain; its upgrade heights come from `regtest.json`. Test harnesses only.
+    Regtest,
 }
 
 pub const NETWORKS: [ZNetwork; 2] = [ZNetwork::Mainnet, ZNetwork::Testnet];
+
+/// Upgrade heights for regtest, as the wallet core reads them from `regtest.json`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RegtestHeights {
+    pub overwinter: Option<u32>,
+    pub sapling: Option<u32>,
+    pub blossom: Option<u32>,
+    pub heartwood: Option<u32>,
+    pub canopy: Option<u32>,
+    pub nu5: Option<u32>,
+    pub nu6: Option<u32>,
+    pub nu6_1: Option<u32>,
+    pub nu6_2: Option<u32>,
+    pub nu6_3: Option<u32>,
+    pub nu7: Option<u32>,
+}
+
+static REGTEST: OnceLock<LocalNetwork> = OnceLock::new();
+
+/// Sets the regtest upgrade heights once per process, before the node opens; later calls
+/// are ignored.
+pub fn configure_regtest(h: &RegtestHeights) {
+    let b = |v: Option<u32>| v.map(BlockHeight::from);
+    let _ = REGTEST.set(LocalNetwork {
+        overwinter: b(h.overwinter),
+        sapling: b(h.sapling),
+        blossom: b(h.blossom),
+        heartwood: b(h.heartwood),
+        canopy: b(h.canopy),
+        nu5: b(h.nu5),
+        nu6: b(h.nu6),
+        nu6_1: b(h.nu6_1),
+        nu6_2: b(h.nu6_2),
+        nu6_3: b(h.nu6_3),
+        nu7: b(h.nu7),
+    });
+}
+
+pub fn regtest_configured() -> bool {
+    REGTEST.get().is_some()
+}
+
+/// The networks kept: mainnet and testnet, and regtest once configured.
+pub fn networks() -> Vec<ZNetwork> {
+    let mut out = NETWORKS.to_vec();
+    if regtest_configured() {
+        out.push(ZNetwork::Regtest);
+    }
+    out
+}
 
 impl ZNetwork {
     pub fn name(self) -> &'static str {
         match self {
             ZNetwork::Mainnet => "mainnet",
             ZNetwork::Testnet => "testnet",
+            ZNetwork::Regtest => "regtest",
         }
     }
 
+    /// Regtest only parses once its heights are configured.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "mainnet" | "main" => Some(ZNetwork::Mainnet),
             "testnet" | "test" => Some(ZNetwork::Testnet),
+            "regtest" if regtest_configured() => Some(ZNetwork::Regtest),
             _ => None,
         }
     }
@@ -37,14 +96,13 @@ impl ZNetwork {
         match self {
             ZNetwork::Mainnet => "main",
             ZNetwork::Testnet => "test",
+            ZNetwork::Regtest => "regtest",
         }
     }
 
-    fn inner(self) -> consensus::Network {
-        match self {
-            ZNetwork::Mainnet => consensus::Network::MainNetwork,
-            ZNetwork::Testnet => consensus::Network::TestNetwork,
-        }
+    /// Whether a server's reported chain name fits. Zebra names regtest "test", zcashd "regtest".
+    pub fn accepts_lightd_chain(self, name: &str) -> bool {
+        name == self.lightd_chain_name() || (self == ZNetwork::Regtest && name == "test")
     }
 
     /// The consensus branch ID this build expects at `height`.
@@ -60,13 +118,19 @@ impl ZNetwork {
 
 impl Parameters for ZNetwork {
     fn network_type(&self) -> NetworkType {
-        self.inner().network_type()
+        match self {
+            ZNetwork::Mainnet => NetworkType::Main,
+            ZNetwork::Testnet => NetworkType::Test,
+            ZNetwork::Regtest => NetworkType::Regtest,
+        }
     }
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
         match (self, nu, MAINNET_NU7_OVERRIDE) {
             (ZNetwork::Mainnet, NetworkUpgrade::Nu7, Some(h)) => Some(BlockHeight::from(h)),
-            _ => self.inner().activation_height(nu),
+            (ZNetwork::Mainnet, _, _) => consensus::Network::MainNetwork.activation_height(nu),
+            (ZNetwork::Testnet, _, _) => consensus::Network::TestNetwork.activation_height(nu),
+            (ZNetwork::Regtest, _, _) => REGTEST.get().and_then(|l| l.activation_height(nu)),
         }
     }
 }
@@ -107,5 +171,22 @@ mod tests {
         assert_eq!(ZNetwork::parse("testnet").map(ZNetwork::lightd_chain_name), Some("test"));
         assert_eq!(ZNetwork::parse("regtest"), None);
         assert_eq!(serde_json::to_string(&ZNetwork::Mainnet).unwrap(), "\"mainnet\"");
+    }
+
+    #[test]
+    fn regtest_is_refused_until_configured() {
+        // Heights are per process: no unit test sets them, tests/regtest.rs does.
+        assert!(!regtest_configured());
+        assert_eq!(ZNetwork::parse("regtest"), None);
+        assert_eq!(networks(), NETWORKS);
+        assert_eq!(ZNetwork::Regtest.nu7_height(), None);
+        assert_eq!(serde_json::to_string(&ZNetwork::Regtest).unwrap(), "\"regtest\"");
+    }
+
+    #[test]
+    fn chain_names() {
+        assert!(ZNetwork::Regtest.accepts_lightd_chain("test") && ZNetwork::Regtest.accepts_lightd_chain("regtest"));
+        assert!(ZNetwork::Testnet.accepts_lightd_chain("test") && !ZNetwork::Testnet.accepts_lightd_chain("regtest"));
+        assert!(ZNetwork::Mainnet.accepts_lightd_chain("main") && !ZNetwork::Mainnet.accepts_lightd_chain("test"));
     }
 }

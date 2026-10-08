@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::health::{self, Row, ServerHealth};
-use crate::network::{ZNetwork, NETWORKS};
+use crate::network::{networks, ZNetwork};
 use crate::proxy;
 use crate::reply;
 use crate::servers::{self, preset_servers, Preset, Route, Server, Source, MAX_SERVERS};
@@ -195,7 +195,7 @@ impl Node {
             None => Store::seeded(),
         };
         let mut inner = Inner { store, health: HashMap::new(), sent_health: HashMap::new(), sent_routes: HashMap::new() };
-        for net in NETWORKS {
+        for net in networks() {
             let _ = inner.changes(net);
         }
         Arc::new(Self { inner: Mutex::new(inner), path, sink, wake: Notify::new() })
@@ -227,7 +227,7 @@ impl Node {
         let (out, events) = {
             let mut inner = self.lock();
             let mut cfg = inner.cfg(net).clone();
-            let (out, mut events) = match change(&mut cfg).and_then(|r| cfg.validate().map(|_| r)) {
+            let (out, mut events) = match change(&mut cfg).and_then(|r| cfg.validate(net).map(|_| r)) {
                 Ok(r) => r,
                 Err(e) => return reply::err(e),
             };
@@ -269,9 +269,12 @@ impl Node {
     }
 
     /// A preset replaces the list; servers the user added stay, disabled. `custom`
-    /// keeps the list as it is.
+    /// keeps the list as it is. Regtest has no presets.
     pub fn apply_preset(&self, network: &str, name: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
+        if net == ZNetwork::Regtest {
+            return reply::err("regtest has no presets; use set_servers");
+        }
         let Some(preset) = Preset::parse(name) else {
             return reply::err("preset must be two-operators, single or custom");
         };
@@ -291,7 +294,7 @@ impl Node {
 
     pub fn set_proxy(&self, network: &str, config_json: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
-        let (proxy, required) = match proxy::parse_config(config_json) {
+        let (proxy, required) = match proxy::parse_config(net, config_json) {
             Ok(c) => c,
             Err(e) => return reply::err(e),
         };
@@ -389,7 +392,7 @@ impl Node {
     pub fn flush(&self) {
         let events: Vec<Event> = {
             let mut inner = self.lock();
-            NETWORKS.iter().flat_map(|n| inner.changes(*n)).collect()
+            networks().into_iter().flat_map(|n| inner.changes(n)).collect()
         };
         self.emit(events);
     }
@@ -496,6 +499,25 @@ mod tests {
     }
 
     #[test]
+    fn regtest_needs_configuring_and_direct_is_regtest_only() {
+        let h = harness();
+        let lwd = r#"[{"id":"lwd","url":"http://127.0.0.1:29061","operator":"local"}]"#;
+        let direct = r#"{"proxy":"direct","proxyRequired":false}"#;
+        // No unit test configures regtest (tests/regtest.rs does, in its own process).
+        for reply in [h.node.servers("regtest"), h.node.set_servers("regtest", lwd), h.node.set_proxy("regtest", direct)] {
+            assert_eq!(v(reply)["error"], "network must be mainnet or testnet");
+        }
+        for net in ["mainnet", "testnet"] {
+            assert!(v(h.node.set_proxy(net, direct))["error"].as_str().unwrap().contains("only for a loopback regtest server"));
+            assert!(v(h.node.set_servers(net, lwd))["error"].as_str().unwrap().contains("only https"));
+            assert_eq!(v(h.node.route_table(net))["proxy"], "socks5h://127.0.0.1:9050");
+        }
+        assert!(h.take().is_empty());
+        let (targets, no_proxy) = h.node.poll_plan();
+        assert!(no_proxy.is_empty() && targets.iter().all(|t| t.network != ZNetwork::Regtest && t.proxy != "direct"));
+    }
+
+    #[test]
     fn presets_and_custom_lists() {
         let h = harness();
         let s = v(h.node.apply_preset("mainnet", "single"));
@@ -534,6 +556,7 @@ mod tests {
         let ok = |t: &Target| match t.network {
             ZNetwork::Mainnet => answer(ZNetwork::Mainnet, "main", "37a5165b", 3_500_000),
             ZNetwork::Testnet => answer(ZNetwork::Testnet, "test", "77190ad9", 4_480_000),
+            ZNetwork::Regtest => unreachable!("no unit test configures regtest"),
         };
         assert_eq!(v(h.node.server_health("mainnet"))["pending"], true);
         poll_all(&h.node, ok);

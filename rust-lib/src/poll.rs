@@ -17,6 +17,7 @@ use crate::net::client::{connect, Client};
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
 use crate::node::{now, Node, Target};
+use crate::proxy;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(50);
@@ -129,7 +130,7 @@ async fn cycle(node: &Node, prober: &mut Prober) {
         .collect();
     let mut results = stream::iter(jobs)
         .map(|(t, iso, client)| async move {
-            let (health, client) = match ProxyAddr::parse(&t.proxy) {
+            let (health, client) = match proxy::addr(t.network, &t.proxy) {
                 Ok(proxy) => probe(t.network, &t.url, &proxy, iso, client).await,
                 Err(e) => (ServerHealth::unreachable(e, now()), None),
             };
