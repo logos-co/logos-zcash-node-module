@@ -1,0 +1,27 @@
+{
+  "name": "zcash_node_module",
+  "display_name": "Zcash Node Servers",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "Zcash lightwalletd-protocol servers per network: presets, the socks5h proxy, a route table per call class, and live health polled over Tor. Fail-closed: no proxy, no route.",
+  "author": "Logos Core Team",
+  "main": "zcash_node_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "ZcashNodeModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "rust": {
+      "toolchain": "1.96.0",
+      "packages": { "build": [], "runtime": [] }
+    },
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
