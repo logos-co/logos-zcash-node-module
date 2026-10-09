@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
+use crate::net::client::{is_lan_host, is_onion};
 use crate::network::ZNetwork;
 
 /// What a server may be asked for.
@@ -56,6 +57,9 @@ pub struct Server {
     pub enabled: bool,
     pub classes: Vec<CallClass>,
     pub source: Source,
+    /// The user chose to reach this server without Tor. https servers only.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 struct Host {
@@ -129,6 +133,7 @@ pub fn preset_servers(net: ZNetwork, preset: Preset) -> Option<Vec<Server>> {
                 enabled,
                 classes: ALL_CLASSES.to_vec(),
                 source: Source::Preset,
+                direct: false,
             }
         })
         .collect();
@@ -157,6 +162,8 @@ struct ServerInput {
     #[serde(default)]
     #[allow(dead_code)]
     source: Option<Source>,
+    #[serde(default)]
+    direct: bool,
 }
 
 fn enabled_by_default() -> bool {
@@ -175,7 +182,7 @@ pub fn parse_list(net: ZNetwork, json: &str) -> Result<Vec<Server>, String> {
             return Err("server list: every entry must be a JSON object".into());
         }
         let s: ServerInput = serde_json::from_value(item).map_err(|e| format!("server list: {e}"))?;
-        let url = normalize_url(net, &s.url)?;
+        let url = normalize_url(&s.url)?;
         let operator = s.operator.trim().to_string();
         let mut classes = s.classes.unwrap_or_else(|| ALL_CLASSES.to_vec());
         classes.sort();
@@ -185,7 +192,7 @@ pub fn parse_list(net: ZNetwork, json: &str) -> Result<Vec<Server>, String> {
             _ => host_of(&url),
         };
         let source = if is_preset_entry(net, &s.id, &url, &operator) { Source::Preset } else { Source::User };
-        out.push(Server { id: s.id, url, operator, label, enabled: s.enabled, classes, source });
+        out.push(Server { id: s.id, url, operator, label, enabled: s.enabled, classes, source, direct: s.direct });
     }
     validate(net, &out)?;
     Ok(out)
@@ -209,7 +216,7 @@ pub fn validate(net: ZNetwork, list: &[Server]) -> Result<(), String> {
         if !ids.insert(s.id.as_str()) {
             return Err(format!("duplicate server id {}", s.id));
         }
-        match normalize_url(net, &s.url) {
+        match normalize_url(&s.url) {
             Ok(n) if n == s.url => {}
             Ok(n) => return Err(format!("{}: url must be written as {n}", s.id)),
             Err(e) => return Err(format!("{}: {e}", s.id)),
@@ -226,6 +233,9 @@ pub fn validate(net: ZNetwork, list: &[Server]) -> Result<(), String> {
         if s.enabled && s.classes.is_empty() {
             return Err(format!("{}: an enabled server needs at least one call class", s.id));
         }
+        if s.direct && crate::net::client::is_onion_url(&s.url) {
+            return Err(format!("{}: an onion service is reached through Tor only", s.id));
+        }
     }
     if !list.iter().any(|s| s.enabled) {
         return Err("at least one server must be enabled".into());
@@ -233,18 +243,23 @@ pub fn validate(net: ZNetwork, list: &[Server]) -> Result<(), String> {
     Ok(())
 }
 
+/// lightwalletd's port, for a server on the user's network given without one.
+pub const LAN_PORT: u16 = 9067;
+
 /// `https://host:port`, lowercase host, port 443 when absent; a v3 onion service as
-/// `http://<onion>:port`; on regtest also a loopback lightwalletd as `http://127.0.0.1:port`.
-/// Anything else is refused.
-pub fn normalize_url(net: ZNetwork, url: &str) -> Result<String, String> {
+/// `http://<onion>:port`; a server on the user's network also as `http://host:port`, port
+/// 9067 when absent. Without a scheme, onion and LAN hosts take http and the rest https.
+pub fn normalize_url(url: &str) -> Result<String, String> {
     let bad = || format!("{url}: url must be https://host:port");
-    let uri: Uri = url.trim().parse().map_err(|_| bad())?;
-    let plain = uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("http"));
-    let onion = plain && uri.host().is_some_and(|h| crate::net::client::is_onion(&h.to_ascii_lowercase()));
-    let http = plain && (onion || net == ZNetwork::Regtest);
-    if !http && !uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https")) {
-        return Err(format!("{url}: only https servers are allowed"));
-    }
+    let url = url.trim();
+    let full = if url.contains("://") {
+        url.to_string()
+    } else {
+        let host = format!("http://{url}").parse::<Uri>().ok().and_then(|u| u.host().map(str::to_ascii_lowercase));
+        let plain = host.is_some_and(|h| is_onion(&h) || is_lan_host(&h));
+        format!("{}://{url}", if plain { "http" } else { "https" })
+    };
+    let uri: Uri = full.parse().map_err(|_| bad())?;
     let authority = uri.authority().ok_or_else(bad)?;
     if authority.as_str().contains('@') || uri.query().is_some() || !matches!(uri.path(), "" | "/") {
         return Err(bad());
@@ -253,24 +268,20 @@ pub fn normalize_url(net: ZNetwork, url: &str) -> Result<String, String> {
     if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || "-.[]:".contains(c)) {
         return Err(bad());
     }
-    let port = authority.port_u16().unwrap_or(443);
-    if port == 0 {
+    let port = authority.port_u16();
+    if port == Some(0) {
         return Err(bad());
     }
-    if onion {
-        return match authority.port_u16() {
+    match uri.scheme_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("https") => Ok(format!("https://{host}:{}", port.unwrap_or(443))),
+        Some("http") if is_onion(&host) => match port {
             Some(port) => Ok(format!("http://{host}:{port}")),
             None => Err(format!("{url}: an onion server needs its port, http://<onion>:port")),
-        };
+        },
+        Some("http") if is_lan_host(&host) => Ok(format!("http://{host}:{}", port.unwrap_or(LAN_PORT))),
+        Some("http") => Err(format!("{url}: plain http is only for onion services and servers on your network")),
+        _ => Err(format!("{url}: only https servers are allowed")),
     }
-    if http {
-        // The wallet core takes plain http only from this exact prefix.
-        return match (host.as_str(), authority.port_u16()) {
-            ("127.0.0.1", Some(port)) => Ok(format!("http://127.0.0.1:{port}")),
-            _ => Err(format!("{url}: plain http is only for a loopback server, http://127.0.0.1:port")),
-        };
-    }
-    Ok(format!("https://{host}:{port}"))
 }
 
 fn host_of(url: &str) -> String {
@@ -401,6 +412,7 @@ mod tests {
             enabled: true,
             classes: vec![CallClass::Sync, CallClass::Tip],
             source: Source::User,
+            direct: false,
         });
         let r = routes(&list, all);
         assert_eq!(ids(&r.sync), ["zec.rocks", "us.zec.stardust.rest", "mine"]);
@@ -441,8 +453,8 @@ mod tests {
         assert_eq!(parse_list(ZNetwork::Mainnet, spoof).unwrap()[0].source, Source::User);
 
         for (bad, why) in [
-            (r#"[{"id":"a","url":"http://a.example:9067","operator":"x"}]"#, "only https"),
-            (r#"[{"id":"a","url":"a.example:443","operator":"x"}]"#, "https"),
+            (r#"[{"id":"a","url":"http://a.example:9067","operator":"x"}]"#, "plain http"),
+            (r#"[{"id":"a","url":"ftp://a.example:21","operator":"x"}]"#, "only https"),
             (r#"[{"id":"a","url":"https://a.example/path","operator":"x"}]"#, "https://host:port"),
             (r#"[{"id":"a","url":"https://u@a.example","operator":"x"}]"#, "https://host:port"),
             (r#"[{"id":"a","url":"https://a.example","operator":"x"},{"id":"a","url":"https://b.example","operator":"x"}]"#, "duplicate server id"),
@@ -467,37 +479,55 @@ mod tests {
         let onion = format!("{}.onion", "a2".repeat(28));
         for net in [ZNetwork::Mainnet, ZNetwork::Testnet, ZNetwork::Regtest] {
             let url = format!("http://{}:9067", onion.to_uppercase());
-            assert_eq!(normalize_url(net, &url).unwrap(), format!("http://{onion}:9067"));
-            assert!(normalize_url(net, &format!("http://{onion}")).unwrap_err().contains("needs its port"));
+            assert_eq!(normalize_url(&url).unwrap(), format!("http://{onion}:9067"));
+            assert!(normalize_url(&format!("http://{onion}")).unwrap_err().contains("needs its port"));
+            assert!(parse_list(net, &format!(r#"[{{"id":"o","url":"http://{onion}:9067","operator":"x"}}]"#)).is_ok());
         }
+        assert_eq!(normalize_url(&format!("{onion}:9067")).unwrap(), format!("http://{onion}:9067"));
         // A retired v2 name is not an onion service the wallet takes.
-        assert!(normalize_url(ZNetwork::Mainnet, "http://expyuzz4wqqyqhjn.onion:80").unwrap_err().contains("only https"));
+        assert!(normalize_url("http://expyuzz4wqqyqhjn.onion:80").unwrap_err().contains("plain http"));
         // The preset entry round-trips as a preset.
         let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
         let ours = t.iter().find(|s| s.operator == "logos").unwrap();
-        assert_eq!(normalize_url(ZNetwork::Testnet, &ours.url).unwrap(), ours.url);
+        assert_eq!(normalize_url(&ours.url).unwrap(), ours.url);
         assert!(is_preset_entry(ZNetwork::Testnet, &ours.id, &ours.url, &ours.operator));
     }
 
     #[test]
-    fn loopback_http_only_on_regtest() {
-        assert_eq!(normalize_url(ZNetwork::Regtest, " HTTP://127.0.0.1:29061/ ").unwrap(), "http://127.0.0.1:29061");
-        assert_eq!(normalize_url(ZNetwork::Regtest, "https://A.example").unwrap(), "https://a.example:443");
-        for net in [ZNetwork::Mainnet, ZNetwork::Testnet] {
-            assert!(normalize_url(net, "http://127.0.0.1:29061").unwrap_err().contains("only https"));
-            assert!(parse_list(net, "[]").is_err());
+    fn servers_on_the_users_network() {
+        for (typed, url) in [
+            (" HTTP://127.0.0.1:29061/ ", "http://127.0.0.1:29061"),
+            ("192.168.1.20", "http://192.168.1.20:9067"),
+            ("192.168.1.20:9000", "http://192.168.1.20:9000"),
+            ("http://10.0.0.1", "http://10.0.0.1:9067"),
+            ("https://10.0.0.1", "https://10.0.0.1:443"),
+            ("Framework.LAN:9067", "http://framework.lan:9067"),
+            ("[fd00::2]:9067", "http://[fd00::2]:9067"),
+            ("localhost", "http://localhost:9067"),
+            ("zec.rocks", "https://zec.rocks:443"),
+            ("zec.rocks:9067", "https://zec.rocks:9067"),
+        ] {
+            assert_eq!(normalize_url(typed).unwrap(), url, "{typed}");
         }
-        for url in ["http://10.0.0.1:9067", "http://localhost:9067", "http://[::1]:9067", "http://127.0.0.2:9067", "http://127.0.0.1"] {
-            assert!(normalize_url(ZNetwork::Regtest, url).unwrap_err().contains("http://127.0.0.1:port"), "{url}");
+        for typed in ["http://8.8.8.8:9067", "http://192.169.0.1:9067", "http://framework.example:9067"] {
+            assert!(normalize_url(typed).unwrap_err().contains("plain http"), "{typed}");
         }
-        assert!(normalize_url(ZNetwork::Regtest, "http://127.0.0.1:0").is_err());
+        assert!(normalize_url("http://127.0.0.1:0").is_err());
+        // Tor per server: a public https server may skip it, an onion service may not.
+        let direct = parse_list(ZNetwork::Mainnet, r#"[{"id":"z","url":"https://zec.rocks:443","operator":"z","direct":true}]"#).unwrap();
+        assert!(direct[0].direct);
+        let onion = format!(r#"[{{"id":"o","url":"http://{}.onion:9067","operator":"o","direct":true}}]"#, "a2".repeat(28));
+        assert!(parse_list(ZNetwork::Mainnet, &onion).unwrap_err().contains("through Tor only"));
+        for net in [ZNetwork::Mainnet, ZNetwork::Testnet, ZNetwork::Regtest] {
+            let list = parse_list(net, r#"[{"id":"home","url":"192.168.1.20","operator":"me"}]"#).unwrap();
+            assert_eq!((list[0].url.as_str(), list[0].label.as_str(), list[0].source), ("http://192.168.1.20:9067", "192.168.1.20", Source::User));
+        }
 
         // Regtest has no presets: its list starts, and may stay, empty.
         assert!(preset_servers(ZNetwork::Regtest, Preset::TwoOperators).unwrap().is_empty());
         assert!(parse_list(ZNetwork::Regtest, "[]").unwrap().is_empty());
+        assert!(parse_list(ZNetwork::Testnet, "[]").is_err());
         let list = parse_list(ZNetwork::Regtest, r#"[{"id":"lwd1","url":"http://127.0.0.1:29061","operator":"local"}]"#).unwrap();
-        assert_eq!((list[0].source, list[0].label.as_str()), (Source::User, "127.0.0.1"));
-        assert!(validate(ZNetwork::Regtest, &list).is_ok() && validate(ZNetwork::Testnet, &list).is_err());
         assert_eq!(routes(&list, all).sync[0].url, "http://127.0.0.1:29061");
     }
 }

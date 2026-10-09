@@ -84,23 +84,21 @@ fn route_table_over_a_direct_connection() {
     assert_eq!(node.route_table("regtest"), r#"{"ok":false,"error":"no proxy is set"}"#);
     assert_eq!(v(node.apply_preset("regtest", "two-operators"))["ok"], false);
 
-    // Plain http to 127.0.0.1 only, even on regtest; never on the public networks.
-    for url in ["http://10.0.0.1:9067", "http://localhost:9067", "http://[::1]:9067", "http://127.0.0.1"] {
+    // Plain http only to the user's own network, loopback included.
+    for url in ["http://203.0.113.5:9067", "http://zec.rocks:9067"] {
         let list = json!([{"id": "x", "url": url, "operator": "o"}]).to_string();
         assert_eq!(v(node.set_servers("regtest", &list))["ok"], false, "{url}");
     }
     let lwd = r#"[{"id":"lwd1","url":"http://127.0.0.1:29061","operator":"local"}]"#;
-    for net in ["mainnet", "testnet"] {
-        assert_eq!(v(node.set_servers(net, lwd))["ok"], false);
-        assert_eq!(v(node.set_proxy(net, GO_DIRECT))["ok"], false);
-    }
     assert_eq!(v(node.set_servers("regtest", lwd))["servers"][0]["url"], "http://127.0.0.1:29061");
-    let p = v(node.set_proxy("regtest", GO_DIRECT));
-    assert_eq!((p["proxy"].as_str(), &p["proxyRequired"]), (Some("direct"), &json!(false)));
 
-    // The core's routes take { proxy, servers } from this table unchanged.
+    // A loopback server needs no proxy. The core's routes take { proxy, servers } from this
+    // table unchanged.
     let rt = node.route_table("regtest");
     assert!(rt.starts_with(r#"{"ok":true,"network":"regtest","proxy":"direct","proxyRequired":false,"crossCheck":false,"sync":[{"id":"lwd1","url":"http://127.0.0.1:29061","operator":"local"}],"#), "{rt}");
+    let p = v(node.set_proxy("regtest", GO_DIRECT));
+    assert_eq!((p["proxy"].as_str(), &p["proxyRequired"]), (Some("direct"), &json!(false)));
+    assert_eq!(node.route_table("regtest"), rt);
     assert_eq!(v(node.route_table("mainnet"))["proxy"], "socks5h://127.0.0.1:9050");
     let (targets, _) = node.poll_plan();
     assert!(targets.iter().any(|t| t.network == ZNetwork::Regtest && t.proxy == "direct" && t.url == "http://127.0.0.1:29061"));

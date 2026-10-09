@@ -112,9 +112,9 @@ struct Prober {
 }
 
 async fn cycle(node: &Node, prober: &mut Prober) {
-    let (targets, no_proxy) = node.poll_plan();
-    for net in no_proxy {
-        node.mark_no_proxy(net);
+    let (targets, skipped) = node.poll_plan();
+    for (t, why) in &skipped {
+        node.record(t, ServerHealth::unreachable(*why, now()));
     }
     prober.circuits.retain(|t, _| targets.contains(t));
     let jobs: Vec<(Target, Isolation, Option<Client>)> = targets
@@ -130,7 +130,7 @@ async fn cycle(node: &Node, prober: &mut Prober) {
         .collect();
     let mut results = stream::iter(jobs)
         .map(|(t, iso, client)| async move {
-            let (health, client) = match proxy::addr(t.network, &t.proxy) {
+            let (health, client) = match proxy::addr(&t.proxy) {
                 Ok(proxy) => probe(t.network, &t.url, &proxy, iso, client).await,
                 Err(e) => (ServerHealth::unreachable(e, now()), None),
             };

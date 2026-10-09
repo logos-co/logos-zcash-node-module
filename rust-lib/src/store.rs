@@ -70,7 +70,7 @@ impl NetConfig {
     pub fn validate(&self, net: ZNetwork) -> Result<(), String> {
         servers::validate(net, &self.servers)?;
         if let Some(p) = &self.proxy {
-            if proxy::normalize(net, p)? != *p {
+            if proxy::normalize(p)? != *p {
                 return Err(format!("proxy {p} is not normalized"));
             }
         }
@@ -196,6 +196,7 @@ mod tests {
             enabled: false,
             classes: vec![CallClass::Tip],
             source: Source::User,
+            direct: true,
         });
         main.suspects.insert("zec.rocks".into(), Suspicion { kind: "block_hash".into(), height: 7, at: 9 });
         let test = store.networks.get_mut(&ZNetwork::Testnet).unwrap();
@@ -226,7 +227,7 @@ mod tests {
         let mut bad = Store::seeded();
         bad.networks.get_mut(&ZNetwork::Mainnet).unwrap().servers[0].url = "http://zec.rocks:443".into();
         bad.save(&path).unwrap();
-        assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains("only https")));
+        assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains("plain http")));
         let mut socks = Store::seeded();
         socks.networks.get_mut(&ZNetwork::Testnet).unwrap().proxy = Some("socks5://127.0.0.1:9050".into());
         socks.save(&path).unwrap();
