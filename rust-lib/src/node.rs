@@ -11,13 +11,29 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::health::{self, Row, ServerHealth};
+use crate::net::client::is_lan_url;
 use crate::network::{networks, ZNetwork};
-use crate::proxy;
+use crate::proxy::{self, DIRECT};
 use crate::reply;
 use crate::servers::{self, preset_servers, CallClass, Preset, Route, Server, Source, MAX_SERVERS};
 use crate::store::{NetConfig, Store, Suspicion};
 
 pub const NO_PROXY: &str = "no proxy is set";
+
+/// Why `s` cannot be dialled as configured, if it cannot. A server on the user's network, or one
+/// the user set to skip Tor, is reached directly; every other one needs the proxy.
+fn blocked(cfg: &NetConfig, s: &Server) -> Option<&'static str> {
+    match cfg.proxy.as_deref() {
+        _ if is_lan_url(&s.url) || s.direct => None,
+        None | Some(DIRECT) => Some(NO_PROXY),
+        Some(_) => None,
+    }
+}
+
+/// The enabled servers the user set to skip Tor, as the wallet core's routes list them.
+fn direct_urls(cfg: &NetConfig) -> Vec<String> {
+    cfg.servers.iter().filter(|s| s.enabled && s.direct).map(|s| s.url.clone()).collect()
+}
 
 pub enum Event {
     HealthChanged { network: ZNetwork, payload: String },
@@ -74,6 +90,7 @@ struct RouteTable<'a> {
     broadcast: Vec<Route>,
     mempool: Vec<Route>,
     tip: Vec<Route>,
+    direct: Vec<String>,
 }
 
 impl Inner {
@@ -95,22 +112,29 @@ impl Inner {
         self.health.retain(|(n, id), (url, _)| *n != net || live.iter().any(|(i, u)| i == id && u == url));
     }
 
-    /// Fail closed: without a proxy there is no route to a server at all.
+    /// Fail closed: only servers that can be dialled as configured are routed. Without a
+    /// proxy, that leaves the servers on the user's network, which need none.
     fn route_table(&self, net: ZNetwork) -> String {
         let cfg = self.cfg(net);
         let usable = |s: &Server| {
-            !cfg.suspects.contains_key(&s.id) && !self.health_of(net, s).is_some_and(|h| h.incompatible)
+            blocked(cfg, s).is_none()
+                && !cfg.suspects.contains_key(&s.id)
+                && !self.health_of(net, s).is_some_and(|h| h.incompatible)
         };
         let r = servers::routes(&cfg.servers, usable);
         if cfg.local_node {
             return self.local_route_table(net, cfg, r.broadcast);
         }
-        let Some(proxy) = cfg.proxy.as_deref() else { return reply::err(NO_PROXY) };
+        let proxy = match cfg.proxy.as_deref() {
+            Some(p) => p,
+            None if !r.sync.is_empty() => DIRECT,
+            None => return reply::err(NO_PROXY),
+        };
         let table = RouteTable {
             ok: true,
             network: net.name(),
             proxy,
-            proxy_required: cfg.proxy_required,
+            proxy_required: cfg.proxy_required && proxy != DIRECT,
             cross_check: r.cross_check,
             sync: r.sync,
             details: r.details,
@@ -118,29 +142,28 @@ impl Inner {
             broadcast: r.broadcast,
             mempool: r.mempool,
             tip: r.tip,
+            direct: direct_urls(cfg),
         };
         serde_json::to_string(&table).unwrap_or_else(reply::err)
     }
 
     /// Every read from the local node, which checks the chain itself, so nothing is cross-checked.
-    /// Broadcasts stay on the servers over Tor, even when none is usable right now; only a user
-    /// with no server enabled at all has the node send them itself.
+    /// Broadcasts stay on the servers, even when none is usable right now; only a user with no
+    /// server enabled at all has the node send them itself.
     fn local_route_table(&self, net: ZNetwork, cfg: &NetConfig, remote: Vec<Route>) -> String {
         let local = vec![Route { id: "local".into(), url: LOCAL_NODE_URL.into(), operator: "local".into() }];
-        let any_enabled = cfg.servers.iter().any(|s| s.enabled && s.classes.contains(&CallClass::Broadcast));
-        let (broadcast, proxy) = if !any_enabled {
-            (local.clone(), "")
-        } else {
-            match cfg.proxy.as_deref() {
-                Some(p) => (remote, p),
-                None => return reply::err(NO_PROXY),
-            }
+        let senders: Vec<&Server> = cfg.servers.iter().filter(|s| s.enabled && s.classes.contains(&CallClass::Broadcast)).collect();
+        let (broadcast, proxy) = match cfg.proxy.as_deref() {
+            _ if senders.is_empty() => (local.clone(), ""),
+            Some(p) => (remote, p),
+            None if senders.iter().any(|s| is_lan_url(&s.url) || s.direct) => (remote, DIRECT),
+            None => return reply::err(NO_PROXY),
         };
         let table = RouteTable {
             ok: true,
             network: net.name(),
             proxy,
-            proxy_required: cfg.proxy_required && !proxy.is_empty(),
+            proxy_required: cfg.proxy_required && !matches!(proxy, "" | DIRECT),
             cross_check: false,
             sync: local.clone(),
             details: local.clone(),
@@ -148,6 +171,7 @@ impl Inner {
             broadcast,
             mempool: local.clone(),
             tip: local,
+            direct: direct_urls(cfg),
         };
         serde_json::to_string(&table).unwrap_or_else(reply::err)
     }
@@ -322,6 +346,10 @@ impl Node {
         };
         self.mutate(net, true, |cfg| {
             if let Some(mut list) = preset_servers(net, preset) {
+                // The user's choice of Tor for a preset server outlives the preset.
+                for p in list.iter_mut() {
+                    p.direct = cfg.servers.iter().any(|s| s.id == p.id && s.url == p.url && s.direct);
+                }
                 for s in cfg.servers.iter().filter(|s| s.source == Source::User) {
                     if list.len() < MAX_SERVERS && !list.iter().any(|p| p.id == s.id || p.url == s.url) {
                         list.push(Server { enabled: false, ..s.clone() });
@@ -336,7 +364,7 @@ impl Node {
 
     pub fn set_proxy(&self, network: &str, config_json: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
-        let (proxy, required) = match proxy::parse_config(net, config_json) {
+        let (proxy, required) = match proxy::parse_config(config_json) {
             Ok(c) => c,
             Err(e) => return reply::err(e),
         };
@@ -419,31 +447,22 @@ impl Node {
         }
     }
 
-    /// The enabled servers to poll, and the networks that have no proxy.
-    pub fn poll_plan(&self) -> (Vec<Target>, Vec<ZNetwork>) {
+    /// The enabled servers to poll, and those that cannot be dialled as configured, with why.
+    /// Nothing is dialled for those: they read unreachable.
+    pub fn poll_plan(&self) -> (Vec<Target>, Vec<(Target, &'static str)>) {
         let inner = self.lock();
-        let (mut targets, mut no_proxy) = (Vec::new(), Vec::new());
+        let (mut targets, mut skipped) = (Vec::new(), Vec::new());
         for (net, cfg) in &inner.store.networks {
-            let Some(proxy) = &cfg.proxy else {
-                no_proxy.push(*net);
-                continue;
-            };
             for s in cfg.servers.iter().filter(|s| s.enabled) {
-                targets.push(Target { network: *net, id: s.id.clone(), url: s.url.clone(), proxy: proxy.clone() });
+                let proxy = if s.direct { DIRECT.into() } else { cfg.proxy.clone().unwrap_or_else(|| DIRECT.into()) };
+                let t = Target { network: *net, id: s.id.clone(), url: s.url.clone(), proxy };
+                match blocked(cfg, s) {
+                    Some(why) => skipped.push((t, why)),
+                    None => targets.push(t),
+                }
             }
         }
-        (targets, no_proxy)
-    }
-
-    /// Without a proxy nothing is dialled: every enabled server reads unreachable.
-    pub fn mark_no_proxy(&self, net: ZNetwork) {
-        let at = now();
-        let mut inner = self.lock();
-        let enabled: Vec<(String, String)> =
-            inner.cfg(net).servers.iter().filter(|s| s.enabled).map(|s| (s.id.clone(), s.url.clone())).collect();
-        for (id, url) in enabled {
-            inner.health.insert((net, id), (url, ServerHealth::unreachable(NO_PROXY, at)));
-        }
+        (targets, skipped)
     }
 
     /// Stores a poll result, unless the server changed or went away meanwhile.
@@ -565,9 +584,9 @@ mod tests {
     }
 
     fn poll_all(node: &Node, f: impl Fn(&Target) -> ServerHealth) {
-        let (targets, no_proxy) = node.poll_plan();
-        for n in no_proxy {
-            node.mark_no_proxy(n);
+        let (targets, skipped) = node.poll_plan();
+        for (t, why) in &skipped {
+            node.record(t, ServerHealth::unreachable(*why, now()));
         }
         for t in &targets {
             node.record(t, f(t));
@@ -581,7 +600,7 @@ mod tests {
         let rt = h.node.route_table("testnet");
         assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true,"crossCheck":true,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"},{"id":"#), "{rt}");
         let keys: Vec<String> = v(rt).as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 11);
+        assert_eq!(keys.len(), 12);
 
         let main = v(h.node.route_table("mainnet"));
         assert_eq!(ids(&main, "sync"), ["zec.rocks", "us.zec.stardust.rest"]);
@@ -593,9 +612,12 @@ mod tests {
         h.node.set_proxy("testnet", r#"{"proxy":null,"proxyRequired":false}"#);
         assert_eq!(h.node.route_table("testnet"), r#"{"ok":false,"error":"no proxy is set"}"#);
         // The poller dials nothing on a network without a proxy.
-        let (targets, no_proxy) = h.node.poll_plan();
-        assert!(targets.iter().all(|t| t.network == ZNetwork::Mainnet) && no_proxy == [ZNetwork::Testnet]);
-        h.node.mark_no_proxy(ZNetwork::Testnet);
+        let (targets, skipped) = h.node.poll_plan();
+        assert!(targets.iter().all(|t| t.network == ZNetwork::Mainnet) && skipped.len() == 2);
+        assert!(skipped.iter().all(|(t, why)| t.network == ZNetwork::Testnet && *why == NO_PROXY));
+        for (t, why) in &skipped {
+            h.node.record(t, ServerHealth::unreachable(*why, now()));
+        }
         let health = v(h.node.server_health("testnet"));
         assert_eq!((health["overall"].as_str(), health["servers"][0]["lastError"].as_str()), (Some("offline"), Some(NO_PROXY)));
 
@@ -607,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn regtest_needs_configuring_and_direct_is_regtest_only() {
+    fn regtest_needs_configuring() {
         let h = harness();
         let lwd = r#"[{"id":"lwd","url":"http://127.0.0.1:29061","operator":"local"}]"#;
         let direct = r#"{"proxy":"direct","proxyRequired":false}"#;
@@ -615,14 +637,68 @@ mod tests {
         for reply in [h.node.servers("regtest"), h.node.set_servers("regtest", lwd), h.node.set_proxy("regtest", direct)] {
             assert_eq!(v(reply)["error"], "network must be mainnet or testnet");
         }
-        for net in ["mainnet", "testnet"] {
-            assert!(v(h.node.set_proxy(net, direct))["error"].as_str().unwrap().contains("only for a loopback regtest server"));
-            assert!(v(h.node.set_servers(net, lwd))["error"].as_str().unwrap().contains("only https"));
-            assert_eq!(v(h.node.route_table(net))["proxy"], "socks5h://127.0.0.1:9050");
-        }
         assert!(h.take().is_empty());
-        let (targets, no_proxy) = h.node.poll_plan();
-        assert!(no_proxy.is_empty() && targets.iter().all(|t| t.network != ZNetwork::Regtest && t.proxy != "direct"));
+        let (targets, skipped) = h.node.poll_plan();
+        assert!(skipped.is_empty() && targets.iter().all(|t| t.network != ZNetwork::Regtest && t.proxy != DIRECT));
+    }
+
+    #[test]
+    fn lan_servers_and_tor_per_server() {
+        let h = harness();
+        // A node on the user's network, typed as an address: dialled directly, so no proxy is needed.
+        let s = v(h.node.set_servers("testnet", r#"[{"id":"home","url":"192.168.1.20","operator":"me"}]"#));
+        assert_eq!(s["servers"][0]["url"], "http://192.168.1.20:9067");
+        h.node.set_proxy("testnet", r#"{"proxy":null,"proxyRequired":false}"#);
+        let rt = v(h.node.route_table("testnet"));
+        assert_eq!((ids(&rt, "sync"), rt["proxy"].as_str()), (vec!["home".to_string()], Some(DIRECT)));
+        let (targets, skipped) = h.node.poll_plan();
+        assert!(skipped.is_empty() && targets.iter().any(|t| t.id == "home" && t.proxy == DIRECT));
+        // Next to a public server and without a proxy, only the LAN one is routed.
+        let mixed = r#"[{"id":"home","url":"http://192.168.1.20:9067","operator":"me"},
+                        {"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"}]"#;
+        h.node.set_servers("testnet", mixed);
+        assert_eq!(ids(&v(h.node.route_table("testnet")), "sync"), ["home"]);
+        let (_, skipped) = h.node.poll_plan();
+        assert_eq!(skipped.iter().map(|(t, why)| (t.id.as_str(), *why)).collect::<Vec<_>>(), [("testnet.zec.rocks", NO_PROXY)]);
+        // The local node broadcasts through the LAN server then, with no proxy either.
+        h.node.set_local_node("testnet", true);
+        let rt = v(h.node.route_table("testnet"));
+        assert_eq!((ids(&rt, "broadcast"), rt["proxy"].as_str()), (vec!["home".to_string()], Some(DIRECT)));
+        h.node.set_local_node("testnet", false);
+
+        // Tor per server: zec.rocks skips it, the onion service keeps it.
+        h.node.apply_preset("testnet", "two-operators");
+        let tor = r#"{"proxy":"socks5h://127.0.0.1:9050","proxyRequired":true}"#;
+        h.node.set_proxy("testnet", tor);
+        let mut list = v(h.node.servers("testnet"))["servers"].clone();
+        let onion = list.as_array().unwrap().iter().find(|s| s["id"].as_str().unwrap().ends_with(".onion")).unwrap()["id"].clone();
+        for s in list.as_array_mut().unwrap().iter_mut().filter(|s| s["id"] == "testnet.zec.rocks") {
+            s["direct"] = json!(true);
+        }
+        assert_eq!(v(h.node.set_servers("testnet", &list.to_string()))["ok"], true);
+        let rt = v(h.node.route_table("testnet"));
+        assert_eq!((ids(&rt, "sync").len(), &rt["direct"]), (2, &json!(["https://testnet.zec.rocks:443"])));
+        assert_eq!(rt["proxy"], "socks5h://127.0.0.1:9050");
+        let (targets, _) = h.node.poll_plan();
+        let proxy_of = |id: &Value| targets.iter().find(|t| t.network == ZNetwork::Testnet && t.id == *id).unwrap().proxy.clone();
+        assert_eq!((proxy_of(&json!("testnet.zec.rocks")).as_str(), proxy_of(&onion).as_str()), (DIRECT, "socks5h://127.0.0.1:9050"));
+        // The choice outlives re-applying the preset.
+        h.node.apply_preset("testnet", "two-operators");
+        assert_eq!(v(h.node.route_table("testnet"))["direct"], json!(["https://testnet.zec.rocks:443"]));
+        // Without a proxy, the server that skips Tor is still routed, and the onion service is not.
+        h.node.set_proxy("testnet", r#"{"proxy":null,"proxyRequired":false}"#);
+        let rt = v(h.node.route_table("testnet"));
+        assert_eq!((ids(&rt, "sync"), rt["proxy"].as_str()), (vec!["testnet.zec.rocks".to_string()], Some(DIRECT)));
+        let (_, skipped) = h.node.poll_plan();
+        assert!(skipped.len() == 1 && json!(skipped[0].0.id) == onion && skipped[0].1 == NO_PROXY);
+        // An onion service is reached through Tor only.
+        for s in list.as_array_mut().unwrap().iter_mut().filter(|s| s["id"] == onion) {
+            s["direct"] = json!(true);
+        }
+        assert!(v(h.node.set_servers("testnet", &list.to_string()))["error"].as_str().unwrap().contains("through Tor only"));
+        // Plain http to a public host stays refused.
+        let public = r#"[{"id":"x","url":"http://zec.rocks:9067","operator":"o"}]"#;
+        assert!(v(h.node.set_servers("testnet", public))["error"].as_str().unwrap().contains("plain http"));
     }
 
     #[test]

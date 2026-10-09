@@ -1,15 +1,14 @@
-//! The proxy setting. Only socks5h is accepted: plain socks5 resolves names
-//! locally, and http(s) proxies cannot isolate Tor circuits. Regtest alone may go
-//! `direct`, to a loopback lightwalletd.
+//! The proxy setting: Tor's SOCKS port. Only socks5h is accepted: plain socks5 resolves
+//! names locally, and http(s) proxies cannot isolate Tor circuits. `direct` means none: only
+//! servers on the user's network, and those the user set to skip Tor, are then reached.
 
 use serde::Deserialize;
 
 use crate::net::socks::ProxyAddr;
-use crate::network::ZNetwork;
 
 pub const DEFAULT_PROXY: &str = "socks5h://127.0.0.1:9050";
 
-/// No proxy, as the wallet core's routes name it: regtest's loopback lightwalletd only.
+/// No proxy, as the wallet core's routes name it.
 pub const DIRECT: &str = "direct";
 
 /// `{ proxy, proxyRequired }` as set_proxy receives it.
@@ -28,7 +27,7 @@ fn required_by_default() -> bool {
 
 /// Parses set_proxy's argument into a normalized `(proxy, proxyRequired)`.
 /// A null or empty proxy clears it, which leaves no usable route.
-pub fn parse_config(net: ZNetwork, json: &str) -> Result<(Option<String>, bool), String> {
+pub fn parse_config(json: &str) -> Result<(Option<String>, bool), String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("proxy config: {e}"))?;
     if !value.is_object() {
         return Err("proxy config must be a JSON object".into());
@@ -36,20 +35,17 @@ pub fn parse_config(net: ZNetwork, json: &str) -> Result<(Option<String>, bool),
     let input: ProxyInput = serde_json::from_value(value).map_err(|e| format!("proxy config: {e}"))?;
     let proxy = match input.proxy.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(url) => Some(normalize(net, url)?),
+        Some(url) => Some(normalize(url)?),
     };
     Ok((proxy, input.proxy_required))
 }
 
 /// Normalizes a proxy URL to `socks5h://host:port`, refusing every other scheme, or
-/// to `direct` on regtest.
-pub fn normalize(net: ZNetwork, url: &str) -> Result<String, String> {
+/// to `direct`.
+pub fn normalize(url: &str) -> Result<String, String> {
     let lower = url.trim().to_ascii_lowercase();
     if lower == DIRECT {
-        return match net {
-            ZNetwork::Regtest => Ok(DIRECT.into()),
-            _ => Err("a direct connection is only for a loopback regtest server".into()),
-        };
+        return Ok(DIRECT.into());
     }
     if lower.starts_with("socks5://") || lower.starts_with("socks4") || lower.starts_with("socks://") {
         return Err("socks5:// resolves names locally; use socks5h://host:port".into());
@@ -72,10 +68,10 @@ pub fn normalize(net: ZNetwork, url: &str) -> Result<String, String> {
     Ok(format!("socks5h://{host}:{}", addr.port))
 }
 
-/// What a stored proxy dials through: `direct` on regtest, a socks5h proxy otherwise.
-pub fn addr(net: ZNetwork, proxy: &str) -> Result<ProxyAddr, String> {
-    match (net, proxy) {
-        (ZNetwork::Regtest, DIRECT) => Ok(ProxyAddr::direct()),
+/// What a stored proxy dials through: nothing for `direct`, a socks5h proxy otherwise.
+pub fn addr(proxy: &str) -> Result<ProxyAddr, String> {
+    match proxy {
+        DIRECT => Ok(ProxyAddr::direct()),
         _ => ProxyAddr::parse(proxy),
     }
 }
@@ -86,7 +82,6 @@ mod tests {
 
     #[test]
     fn accepts_only_socks5h() {
-        let normalize = |url| normalize(ZNetwork::Mainnet, url);
         assert_eq!(normalize("socks5h://127.0.0.1:9050").unwrap(), "socks5h://127.0.0.1:9050");
         assert_eq!(normalize(" SOCKS5H://Tor.Local:9150/ ").unwrap(), "socks5h://tor.local:9150");
         assert_eq!(normalize("socks5h://[::1]:9050").unwrap(), "socks5h://[::1]:9050");
@@ -111,7 +106,6 @@ mod tests {
 
     #[test]
     fn config() {
-        let parse_config = |json| parse_config(ZNetwork::Mainnet, json);
         assert_eq!(
             parse_config(r#"{"proxy":"socks5h://127.0.0.1:19050","proxyRequired":true}"#).unwrap(),
             (Some("socks5h://127.0.0.1:19050".into()), true)
@@ -124,18 +118,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_only_on_regtest() {
+    fn direct_is_no_proxy() {
         let direct = r#"{"proxy":"direct","proxyRequired":false}"#;
-        assert_eq!(parse_config(ZNetwork::Regtest, direct).unwrap(), (Some(DIRECT.into()), false));
-        assert_eq!(normalize(ZNetwork::Regtest, " Direct ").unwrap(), DIRECT);
-        assert_eq!(normalize(ZNetwork::Regtest, "socks5h://127.0.0.1:9050").unwrap(), "socks5h://127.0.0.1:9050");
-        for net in [ZNetwork::Mainnet, ZNetwork::Testnet] {
-            assert!(parse_config(net, direct).unwrap_err().contains("regtest"));
-            assert!(addr(net, DIRECT).is_err());
-        }
-        assert!(addr(ZNetwork::Regtest, DIRECT).unwrap().is_direct());
-        assert!(!addr(ZNetwork::Regtest, DEFAULT_PROXY).unwrap().is_direct());
+        assert_eq!(parse_config(direct).unwrap(), (Some(DIRECT.into()), false));
+        assert_eq!(normalize(" Direct ").unwrap(), DIRECT);
+        assert!(addr(DIRECT).unwrap().is_direct());
+        assert!(!addr(DEFAULT_PROXY).unwrap().is_direct());
         // The sentinel cannot be reached through a proxy URL.
-        assert!(normalize(ZNetwork::Regtest, "socks5h://direct:0").is_err());
+        assert!(normalize("socks5h://direct:0").is_err());
     }
 }
