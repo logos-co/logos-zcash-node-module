@@ -528,10 +528,14 @@ mod tests {
         for class in ["sync", "details", "taddr", "mempool", "tip"] {
             assert_eq!(rt[class][0]["url"], LOCAL_NODE_URL, "{class}");
         }
-        assert_eq!((ids(&rt, "broadcast"), &rt["crossCheck"], &rt["proxy"]), (vec!["testnet.zec.rocks".to_string()], &json!(false), &json!("socks5h://127.0.0.1:9050")));
+        let broadcast = ids(&rt, "broadcast");
+        assert_eq!(broadcast.len(), 2, "both operators");
+        assert_eq!((&rt["crossCheck"], &rt["proxy"]), (&json!(false), &json!("socks5h://127.0.0.1:9050")));
         assert_eq!(v(h.node.servers("testnet"))["localNode"], true);
-        // A suspect server leaves no broadcast route; the local node does not quietly take over.
-        h.node.report_mismatch("testnet", "testnet.zec.rocks", "tip", 1);
+        // Suspect servers leave no broadcast route; the local node does not quietly take over.
+        for id in &broadcast {
+            h.node.report_mismatch("testnet", id, "tip", 1);
+        }
         assert_eq!(v(h.node.route_table("testnet"))["broadcast"], json!([]));
         // Status comes from zebrad_module; it must run this network to be available.
         h.node.set_local_status(Arc::new(FakeLocal(json!({"state": "running", "network": "Testnet", "height": 10}))));
@@ -540,8 +544,10 @@ mod tests {
         assert_eq!(v(h.node.local_node("mainnet"))["available"], false);
         // Off again: the servers take every class back.
         h.node.set_local_node("testnet", false);
-        h.node.clear_suspect("testnet", "testnet.zec.rocks");
-        assert_eq!(ids(&v(h.node.route_table("testnet")), "sync"), vec!["testnet.zec.rocks".to_string()]);
+        for id in &broadcast {
+            h.node.clear_suspect("testnet", id);
+        }
+        assert_eq!(ids(&v(h.node.route_table("testnet")), "sync"), broadcast);
     }
 
     fn answer(net: ZNetwork, chain: &str, branch: &str, tip: u64) -> ServerHealth {
@@ -573,7 +579,7 @@ mod tests {
     fn route_table_shape_and_fail_closed() {
         let h = harness();
         let rt = h.node.route_table("testnet");
-        assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true,"crossCheck":false,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"}],"details":"#), "{rt}");
+        assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true,"crossCheck":true,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"},{"id":"#), "{rt}");
         let keys: Vec<String> = v(rt).as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 11);
 
@@ -645,7 +651,9 @@ mod tests {
         assert_eq!((s["preset"].as_str(), s["servers"].as_array().unwrap().len()), (Some("custom"), 8));
 
         let t = v(h.node.apply_preset("testnet", "two-operators"));
-        assert_eq!(t["servers"].as_array().unwrap().len(), 1);
+        assert_eq!(t["servers"].as_array().unwrap().len(), 2);
+        assert_eq!(v(h.node.route_table("testnet"))["crossCheck"], true);
+        h.node.apply_preset("testnet", "single");
         assert_eq!(v(h.node.route_table("testnet"))["crossCheck"], false);
         assert_eq!(v(h.node.apply_preset("testnet", "three"))["ok"], false);
         assert_eq!(v(h.node.set_servers("mainnet", r#"[{"id":"x","url":"http://x:1","operator":"o"}]"#))["ok"], false);

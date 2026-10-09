@@ -22,8 +22,15 @@ pub enum NetError {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Opens a TLS channel to `server` (https://host:port) through the proxy, on the
-/// circuit `isolation` selects. Only https URLs are accepted.
+/// A v3 onion service. Tor authenticates and encrypts it end to end, so it is reached over
+/// plain HTTP/2 through Tor, without TLS.
+pub fn is_onion(host: &str) -> bool {
+    host.strip_suffix(".onion")
+        .is_some_and(|name| name.len() == 56 && name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')))
+}
+
+/// Opens a TLS channel to `server` (https://host:port), or a plain one to an onion service,
+/// through the proxy, on the circuit `isolation` selects.
 pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
     let uri: Uri = server.parse().map_err(|_| NetError::BadUrl(server.into()))?;
     if proxy.is_direct() {
@@ -39,16 +46,16 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
             .map_err(|source| NetError::Connect { server: server.into(), source })?;
         return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
     }
-    if uri.scheme_str() != Some("https") {
-        return Err(NetError::BadUrl(server.into()));
-    }
     let host = uri.host().ok_or_else(|| NetError::BadUrl(server.into()))?.to_string();
     let wrap = |source| NetError::Connect { server: server.into(), source };
-    let endpoint = Endpoint::from_shared(server.to_string())
-        .map_err(wrap)?
-        .tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host))
-        .map_err(wrap)?
-        .connect_timeout(CONNECT_TIMEOUT);
+    let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
+    let endpoint = match uri.scheme_str() {
+        Some("https") => endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host))
+            .map_err(wrap)?,
+        Some("http") if is_onion(&host) => endpoint,
+        _ => return Err(NetError::BadUrl(server.into())),
+    };
     let channel = endpoint
         .connect_with_connector(Socks5hConnector::new(proxy.clone(), isolation))
         .await

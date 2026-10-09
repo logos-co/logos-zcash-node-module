@@ -69,6 +69,14 @@ const fn h(host: &'static str, port: u16, operator: &'static str, label: &'stati
     Host { host, port, operator, label }
 }
 
+impl Host {
+    /// An onion service is plain http: Tor already authenticates and encrypts it.
+    fn url(&self) -> String {
+        let scheme = if crate::net::client::is_onion(self.host) { "http" } else { "https" };
+        format!("{scheme}://{}:{}", self.host, self.port)
+    }
+}
+
 // Ports verified over Tor with GetLightdInfo (see tests/live.rs). The first host of
 // each operator is the one the presets enable; the rest are failover candidates.
 const MAINNET: &[Host] = &[
@@ -81,7 +89,11 @@ const MAINNET: &[Host] = &[
     h("eu.zec.stardust.rest", 443, "stardust", "Stardust EU"),
 ];
 
-const TESTNET: &[Host] = &[h("testnet.zec.rocks", 443, "zec.rocks", "zec.rocks testnet")];
+const TESTNET: &[Host] = &[
+    h("testnet.zec.rocks", 443, "zec.rocks", "zec.rocks testnet"),
+    // Ours: zebrad and lightwalletd behind an onion service, the testnet's second operator.
+    h("cnphkglrgl6xb4bz4zukbntfimrdqk3u4rf4mys2vhrvc73w3ulhb4id.onion", 9067, "logos", "Logos testnet (onion)"),
+];
 
 fn hosts(net: ZNetwork) -> &'static [Host] {
     match net {
@@ -111,7 +123,7 @@ pub fn preset_servers(net: ZNetwork, preset: Preset) -> Option<Vec<Server>> {
             };
             Server {
                 id: host.host.into(),
-                url: format!("https://{}:{}", host.host, host.port),
+                url: host.url(),
                 operator: host.operator.into(),
                 label: host.label.into(),
                 enabled,
@@ -126,7 +138,7 @@ pub fn preset_servers(net: ZNetwork, preset: Preset) -> Option<Vec<Server>> {
 fn is_preset_entry(net: ZNetwork, id: &str, url: &str, operator: &str) -> bool {
     hosts(net)
         .iter()
-        .any(|h| h.host == id && format!("https://{}:{}", h.host, h.port) == url && h.operator == operator)
+        .any(|h| h.host == id && h.url() == url && h.operator == operator)
 }
 
 /// One entry of set_servers' list. `source` is accepted for round trips but recomputed.
@@ -221,12 +233,15 @@ pub fn validate(net: ZNetwork, list: &[Server]) -> Result<(), String> {
     Ok(())
 }
 
-/// `https://host:port`, lowercase host, port 443 when absent; on regtest also a loopback
-/// lightwalletd as `http://127.0.0.1:port`. Anything else is refused.
+/// `https://host:port`, lowercase host, port 443 when absent; a v3 onion service as
+/// `http://<onion>:port`; on regtest also a loopback lightwalletd as `http://127.0.0.1:port`.
+/// Anything else is refused.
 pub fn normalize_url(net: ZNetwork, url: &str) -> Result<String, String> {
     let bad = || format!("{url}: url must be https://host:port");
     let uri: Uri = url.trim().parse().map_err(|_| bad())?;
-    let http = net == ZNetwork::Regtest && uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("http"));
+    let plain = uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("http"));
+    let onion = plain && uri.host().is_some_and(|h| crate::net::client::is_onion(&h.to_ascii_lowercase()));
+    let http = plain && (onion || net == ZNetwork::Regtest);
     if !http && !uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https")) {
         return Err(format!("{url}: only https servers are allowed"));
     }
@@ -241,6 +256,12 @@ pub fn normalize_url(net: ZNetwork, url: &str) -> Result<String, String> {
     let port = authority.port_u16().unwrap_or(443);
     if port == 0 {
         return Err(bad());
+    }
+    if onion {
+        return match authority.port_u16() {
+            Some(port) => Ok(format!("http://{host}:{port}")),
+            None => Err(format!("{url}: an onion server needs its port, http://<onion>:port")),
+        };
     }
     if http {
         // The wallet core takes plain http only from this exact prefix.
@@ -344,19 +365,23 @@ mod tests {
     }
 
     #[test]
-    fn single_and_testnet_have_no_cross_check() {
+    fn single_has_no_cross_check() {
         let single = preset_servers(ZNetwork::Mainnet, Preset::Single).unwrap();
         assert_eq!(single.iter().filter(|s| s.enabled).count(), 1);
         let r = routes(&single, all);
         assert_eq!(ids(&r.sync), ["zec.rocks"]);
         assert!(!r.cross_check);
-        for p in [Preset::TwoOperators, Preset::Single] {
-            let t = preset_servers(ZNetwork::Testnet, p).unwrap();
-            let r = routes(&t, all);
-            assert_eq!(ids(&r.sync), ["testnet.zec.rocks"]);
-            assert_eq!(r.sync[0].url, "https://testnet.zec.rocks:443");
-            assert!(!r.cross_check);
-        }
+        let t = preset_servers(ZNetwork::Testnet, Preset::Single).unwrap();
+        let r = routes(&t, all);
+        assert_eq!(ids(&r.sync), ["testnet.zec.rocks"]);
+        assert_eq!(r.sync[0].url, "https://testnet.zec.rocks:443");
+        assert!(!r.cross_check);
+        // Testnet's two operators: zec.rocks, and ours behind an onion service.
+        let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
+        let r = routes(&t, all);
+        assert_eq!(r.sync.len(), 2);
+        assert!(r.sync.iter().any(|s| s.url.starts_with("http://") && s.url.ends_with(".onion:9067")));
+        assert!(r.cross_check);
         assert!(preset_servers(ZNetwork::Mainnet, Preset::Custom).is_none());
         assert_eq!(Preset::parse("two-operators"), Some(Preset::TwoOperators));
         assert_eq!(Preset::parse("two_operators"), None);
@@ -435,6 +460,23 @@ mod tests {
             let e = parse_list(ZNetwork::Mainnet, bad).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn onion_servers_are_plain_http_on_every_network() {
+        let onion = format!("{}.onion", "a2".repeat(28));
+        for net in [ZNetwork::Mainnet, ZNetwork::Testnet, ZNetwork::Regtest] {
+            let url = format!("http://{}:9067", onion.to_uppercase());
+            assert_eq!(normalize_url(net, &url).unwrap(), format!("http://{onion}:9067"));
+            assert!(normalize_url(net, &format!("http://{onion}")).unwrap_err().contains("needs its port"));
+        }
+        // A retired v2 name is not an onion service the wallet takes.
+        assert!(normalize_url(ZNetwork::Mainnet, "http://expyuzz4wqqyqhjn.onion:80").unwrap_err().contains("only https"));
+        // The preset entry round-trips as a preset.
+        let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
+        let ours = t.iter().find(|s| s.operator == "logos").unwrap();
+        assert_eq!(normalize_url(ZNetwork::Testnet, &ours.url).unwrap(), ours.url);
+        assert!(is_preset_entry(ZNetwork::Testnet, &ours.id, &ours.url, &ours.operator));
     }
 
     #[test]
