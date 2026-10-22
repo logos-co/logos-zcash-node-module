@@ -6,10 +6,6 @@ use serde::{Deserialize, Serialize};
 use zcash_protocol::consensus::{self, BlockHeight, BranchId, NetworkType, NetworkUpgrade, Parameters};
 use zcash_protocol::local_consensus::LocalNetwork;
 
-/// NU7's mainnet height, set with the wallet core's override of the same name, so
-/// both expect the same branch IDs.
-pub const MAINNET_NU7_OVERRIDE: Option<u32> = None;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ZNetwork {
@@ -126,11 +122,10 @@ impl Parameters for ZNetwork {
     }
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
-        match (self, nu, MAINNET_NU7_OVERRIDE) {
-            (ZNetwork::Mainnet, NetworkUpgrade::Nu7, Some(h)) => Some(BlockHeight::from(h)),
-            (ZNetwork::Mainnet, _, _) => consensus::Network::MainNetwork.activation_height(nu),
-            (ZNetwork::Testnet, _, _) => consensus::Network::TestNetwork.activation_height(nu),
-            (ZNetwork::Regtest, _, _) => REGTEST.get().and_then(|l| l.activation_height(nu)),
+        match self {
+            ZNetwork::Mainnet => consensus::Network::MainNetwork.activation_height(nu),
+            ZNetwork::Testnet => consensus::Network::TestNetwork.activation_height(nu),
+            ZNetwork::Regtest => REGTEST.get().and_then(|l| l.activation_height(nu)),
         }
     }
 }
@@ -160,9 +155,10 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_nu7_is_unset() {
-        assert_eq!(MAINNET_NU7_OVERRIDE, None);
-        assert_eq!(ZNetwork::Mainnet.nu7_height(), None);
+    fn mainnet_nu7() {
+        assert_eq!(ZNetwork::Mainnet.nu7_height(), Some(3_543_405));
+        assert_eq!(ZNetwork::Mainnet.branch_at(3_543_405), 0x7719_0ad9);
+        assert_ne!(ZNetwork::Mainnet.branch_at(3_543_404), 0x7719_0ad9);
     }
 
     #[test]

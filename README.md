@@ -60,8 +60,6 @@ server. The backend and `zcash_wallet_core_module` may read routes and report a 
 which marks a server suspect until the backend clears it. Events: `server_health_changed`,
 `routes_changed`, `server_suspect`.
 
-`MAINNET_NU7_OVERRIDE` in `rust-lib/src/network.rs` must match the wallet core's.
-
 ```bash
 cd rust-lib && cargo test --no-default-features
 ```

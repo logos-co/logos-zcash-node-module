@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn expectations_from_zcash_protocol() {
         assert_eq!(ZNetwork::Mainnet.branch_at(MAIN_TIP + 1), 0x37a5_165b);
-        assert_eq!(ZNetwork::Mainnet.nu7_height(), None);
+        assert_eq!(ZNetwork::Mainnet.nu7_height(), Some(3_543_405));
         assert_eq!(ZNetwork::Testnet.branch_at(TEST_NU7), 0x7719_0ad9);
     }
 
