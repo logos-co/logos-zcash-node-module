@@ -60,7 +60,11 @@ impl TorView {
             Some("starting") => return Self { state: "connecting".into(), progress: 0, detail: String::new(), socks: None },
             e => return failed(e.unwrap_or("tor_module answered without ok").into()),
         }
-        let state = v["state"].as_str().unwrap_or("connecting").to_string();
+        // Asking starts an idle Tor, so idle is only ever a moment's answer.
+        let state = match v["state"].as_str() {
+            None | Some("idle") => "connecting".to_string(),
+            Some(s) => s.to_string(),
+        };
         let detail = match state.as_str() {
             "blocked" | "failed" => v["detail"].as_str().unwrap_or("").to_string(),
             _ => String::new(),
@@ -378,6 +382,13 @@ impl Node {
     pub fn servers(&self, network: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
         servers_reply(net, self.lock().cfg(net))
+    }
+
+    /// Whether a network goes through the built-in Tor: only then is tor_module asked, and
+    /// asking is what starts it.
+    pub fn uses_built_in_tor(&self) -> bool {
+        let inner = self.lock();
+        networks().into_iter().any(|n| inner.cfg(n).proxy.as_deref() == Some(BUILT_IN))
     }
 
     /// tor_module's latest status. Routes and health follow it. The poller looks again when
@@ -984,6 +995,20 @@ mod tests {
     }
 
     #[test]
+    fn tor_is_asked_for_only_while_a_network_uses_it() {
+        let h = harness();
+        let node = &h.node;
+        assert!(node.uses_built_in_tor(), "the default");
+        let own = r#"{"proxy": "socks5h://127.0.0.1:9150"}"#;
+        assert_eq!(v(node.set_proxy("mainnet", own))["ok"], true);
+        assert!(node.uses_built_in_tor(), "testnet still does");
+        assert_eq!(v(node.set_proxy("testnet", r#"{"proxy": "direct"}"#))["ok"], true);
+        assert!(!node.uses_built_in_tor());
+        assert_eq!(v(node.set_proxy("testnet", r#"{"proxy": "tor"}"#))["ok"], true);
+        assert!(node.uses_built_in_tor());
+    }
+
+    #[test]
     fn tor_module_replies() {
         let ok = |s: &str| TorView::from_reply(Ok(s.into()));
         let ready = ok(r#"{"ok":true,"state":"ready","progress":100,"detail":"fresh until 15:00","socks":"socks5h://127.0.0.1:5"}"#);
@@ -991,6 +1016,7 @@ mod tests {
         let blocked = ok(r#"{"ok":true,"state":"blocked","progress":30,"detail":"can't reach relays","socks":"socks5h://127.0.0.1:5"}"#);
         assert_eq!((blocked.state.as_str(), blocked.detail.as_str()), ("blocked", "can't reach relays"));
         assert_eq!(ok(r#"{"ok":false,"error":"starting"}"#).state, "connecting");
+        assert_eq!(ok(r#"{"ok":true,"state":"idle","progress":0,"detail":"","socks":"socks5h://127.0.0.1:5"}"#).state, "connecting");
         let failed = ok(r#"{"ok":false,"error":"tor config: bad dir"}"#);
         assert_eq!((failed.state.as_str(), failed.detail.as_str(), failed.socks), ("failed", "tor config: bad dir", None));
         let unloaded = TorView::from_reply(Err("object_unavailable".into()));

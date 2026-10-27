@@ -164,9 +164,10 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
 /// Bounds each status call, so unloading never waits on tor_module for long.
 const TOR_BUDGET: Duration = Duration::from_millis(1000);
 
-/// Follows tor_module, the built-in Tor: its status every 2 s until it is ready, then every
-/// 30 s. The call is async with a channel: a blocking one from this thread would run nested
-/// on the main thread.
+/// Follows tor_module, the built-in Tor, while a network uses it: its status every 2 s until
+/// it is ready, then every 30 s. Asking starts Tor, so with no network on it nothing is asked
+/// and Tor stays off. The call is async with a channel: a blocking one from this thread would
+/// run nested on the main thread.
 struct TorFollower {
     stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -180,16 +181,21 @@ impl TorFollower {
             // One client: each new one opens its own connection.
             let client = tor_module::TorModuleClient::new();
             loop {
-                let (tx, rx) = std::sync::mpsc::channel();
-                client.status_async_with_timeout(TOR_BUDGET, move |r| {
-                    let _ = tx.send(r.map_err(|e| e.to_string()));
-                });
-                let reply = rx
-                    .recv_timeout(TOR_BUDGET + Duration::from_millis(200))
-                    .unwrap_or_else(|_| Err("tor_module did not answer".into()));
-                let view = TorView::from_reply(reply);
-                let every = Duration::from_secs(if view.state == "ready" { 30 } else { 2 });
-                node.set_tor(view);
+                let mut every = Duration::from_secs(2);
+                if node.uses_built_in_tor() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    client.status_async_with_timeout(TOR_BUDGET, move |r| {
+                        let _ = tx.send(r.map_err(|e| e.to_string()));
+                    });
+                    let reply = rx
+                        .recv_timeout(TOR_BUDGET + Duration::from_millis(200))
+                        .unwrap_or_else(|_| Err("tor_module did not answer".into()));
+                    let view = TorView::from_reply(reply);
+                    if view.state == "ready" {
+                        every = Duration::from_secs(30);
+                    }
+                    node.set_tor(view);
+                }
                 let (lock, cvar) = &*flag;
                 let (stopped, _) = cvar.wait_timeout_while(lock.lock().unwrap(), every, |s| !*s).unwrap();
                 if *stopped {

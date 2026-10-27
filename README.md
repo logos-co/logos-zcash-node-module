@@ -46,7 +46,9 @@ reached.
 ## The built-in Tor
 
 The proxy setting `tor`, the default, is `tor_module`, a dependency the host loads with this
-module. A thread asks it for its status every 2 s until Tor is ready, then every 30 s.
+module. While a network uses it, a thread asks it for its status every 2 s until Tor is
+ready, then every 30 s. Asking is what starts Tor: with every network on the user's own Tor,
+or on none, nothing is asked and the built-in Tor never connects.
 - The route table and the health poller dial its SOCKS port, which changes each time it
   loads. Until the port is known, servers that need Tor have no route
   (`the built-in Tor is not running`), and LAN servers are still reached directly.
