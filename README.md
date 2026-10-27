@@ -10,11 +10,13 @@ have a route: everything else fails closed.
 
 | Preset | Mainnet | Testnet |
 |---|---|---|
-| `two-operators` (default) | zec.rocks and Stardust, one host each | testnet.zec.rocks and ours, an onion service |
+| `two-operators` (default) | zec.rocks and Stardust, one host each | testnet.zec.rocks |
 | `single` | zec.rocks | testnet.zec.rocks |
 | `custom` | your list (`set_servers`) | your list |
 
 The other zec.rocks and Stardust hosts stay in the list, disabled, as failover candidates.
+A preset host a later release drops leaves saved lists when they load; the user's own
+servers stay.
 
 ## Servers and Tor
 

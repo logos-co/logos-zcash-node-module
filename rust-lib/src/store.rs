@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::network::{networks, ZNetwork};
 use crate::proxy::{self, DEFAULT_PROXY};
-use crate::servers::{self, preset_servers, Preset, Server};
+use crate::servers::{self, preset_servers, Preset, Server, Source};
 
 pub const FILE_NAME: &str = "zcash_servers.json";
 pub const VERSION: u32 = 1;
@@ -65,6 +65,23 @@ impl NetConfig {
             was.is_some() && was == self.servers.iter().find(|s| s.id == id).map(|s| &s.url)
         };
         self.suspects.retain(|id, _| same(id));
+    }
+
+    /// Drops the preset servers this release no longer ships; the user's own stay. Some
+    /// server is left enabled, as every list needs one.
+    pub fn retire_presets(&mut self, net: ZNetwork) -> bool {
+        let mut kept = self.servers.clone();
+        kept.retain(|s| s.source == Source::User || servers::is_preset_host(net, &s.id));
+        if kept.len() == self.servers.len() {
+            return false;
+        }
+        if kept.is_empty() {
+            kept = preset_servers(net, Preset::TwoOperators).unwrap_or_default();
+        } else if !kept.iter().any(|s| s.enabled) {
+            kept[0].enabled = true;
+        }
+        self.replace_servers(kept);
+        true
     }
 
     pub fn validate(&self, net: ZNetwork) -> Result<(), String> {
@@ -142,10 +159,20 @@ impl Store {
     }
 
     /// Loads the file, or seeds the presets when it is absent. A corrupt file is kept
-    /// aside as `<file>.corrupt` and replaced by the presets.
+    /// aside as `<file>.corrupt` and replaced by the presets. Retired presets are dropped
+    /// and the file rewritten without them.
     pub fn load_or_seed(path: &Path) -> Self {
         let store = match Self::load(path) {
-            Loaded::Found(s) => return s,
+            Loaded::Found(mut s) => {
+                let mut retired = false;
+                for (net, cfg) in s.networks.iter_mut() {
+                    retired |= cfg.retire_presets(*net);
+                }
+                if !retired {
+                    return s;
+                }
+                s
+            }
             Loaded::Absent => Self::seeded(),
             Loaded::Corrupt(why) => {
                 eprintln!("zcash_node_module: {} is unusable ({why}); seeding the presets", path.display());
@@ -269,5 +296,45 @@ mod tests {
         list[0].url = "https://elsewhere.example:443".into();
         cfg.replace_servers(list);
         assert!(cfg.suspects.is_empty());
+    }
+
+    #[test]
+    fn retired_presets_are_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let (gone, mine) = (format!("{}.onion", "a2".repeat(28)), format!("{}.onion", "b3".repeat(28)));
+        let entry = |id: &str, host: &str, source, enabled| Server {
+            id: id.into(),
+            url: format!("http://{host}:9067"),
+            operator: "x".into(),
+            label: id.into(),
+            enabled,
+            classes: vec![CallClass::Sync],
+            source,
+            direct: false,
+        };
+        // A preset an earlier release shipped, the only server in use, beside the user's own onion.
+        let mut store = Store::seeded();
+        let test = store.networks.get_mut(&ZNetwork::Testnet).unwrap();
+        test.servers[0].enabled = false;
+        test.servers.push(entry(&gone, &gone, Source::Preset, true));
+        test.servers.push(entry("mine", &mine, Source::User, false));
+        test.suspects.insert(gone.clone(), Suspicion { kind: "k".into(), height: 1, at: 1 });
+        store.save(&path).unwrap();
+
+        let back = Store::load_or_seed(&path);
+        let test = &back.networks[&ZNetwork::Testnet];
+        let ids: Vec<_> = test.servers.iter().map(|s| (s.id.as_str(), s.enabled)).collect();
+        assert_eq!(ids, [("testnet.zec.rocks", true), ("mine", false)]);
+        assert!(test.suspects.is_empty());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&gone));
+        assert!(matches!(Store::load(&path), Loaded::Found(s) if s == back));
+
+        // A list of nothing else falls back to the presets.
+        let mut only = NetConfig::seeded(ZNetwork::Testnet);
+        only.servers = vec![entry(&gone, &gone, Source::Preset, true)];
+        assert!(only.retire_presets(ZNetwork::Testnet));
+        assert_eq!(only.servers, preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap());
+        assert!(!only.retire_presets(ZNetwork::Testnet));
     }
 }

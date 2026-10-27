@@ -95,8 +95,6 @@ const MAINNET: &[Host] = &[
 
 const TESTNET: &[Host] = &[
     h("testnet.zec.rocks", 443, "zec.rocks", "zec.rocks testnet"),
-    // Ours: zebrad and lightwalletd behind an onion service, the testnet's second operator.
-    h("cnphkglrgl6xb4bz4zukbntfimrdqk3u4rf4mys2vhrvc73w3ulhb4id.onion", 9067, "logos", "Logos testnet (onion)"),
 ];
 
 fn hosts(net: ZNetwork) -> &'static [Host] {
@@ -144,6 +142,11 @@ fn is_preset_entry(net: ZNetwork, id: &str, url: &str, operator: &str) -> bool {
     hosts(net)
         .iter()
         .any(|h| h.host == id && h.url() == url && h.operator == operator)
+}
+
+/// Whether this release still ships a preset host with this id.
+pub fn is_preset_host(net: ZNetwork, id: &str) -> bool {
+    hosts(net).iter().any(|h| h.host == id)
 }
 
 /// One entry of set_servers' list. `source` is accepted for round trips but recomputed.
@@ -387,12 +390,8 @@ mod tests {
         assert_eq!(ids(&r.sync), ["testnet.zec.rocks"]);
         assert_eq!(r.sync[0].url, "https://testnet.zec.rocks:443");
         assert!(!r.cross_check);
-        // Testnet's two operators: zec.rocks, and ours behind an onion service.
-        let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
-        let r = routes(&t, all);
-        assert_eq!(r.sync.len(), 2);
-        assert!(r.sync.iter().any(|s| s.url.starts_with("http://") && s.url.ends_with(".onion:9067")));
-        assert!(r.cross_check);
+        // Testnet has one operator, so both presets are its one host.
+        assert_eq!(preset_servers(ZNetwork::Testnet, Preset::TwoOperators), Some(t));
         assert!(preset_servers(ZNetwork::Mainnet, Preset::Custom).is_none());
         assert_eq!(Preset::parse("two-operators"), Some(Preset::TwoOperators));
         assert_eq!(Preset::parse("two_operators"), None);
@@ -486,11 +485,6 @@ mod tests {
         assert_eq!(normalize_url(&format!("{onion}:9067")).unwrap(), format!("http://{onion}:9067"));
         // A retired v2 name is not an onion service the wallet takes.
         assert!(normalize_url("http://expyuzz4wqqyqhjn.onion:80").unwrap_err().contains("plain http"));
-        // The preset entry round-trips as a preset.
-        let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
-        let ours = t.iter().find(|s| s.operator == "logos").unwrap();
-        assert_eq!(normalize_url(&ours.url).unwrap(), ours.url);
-        assert!(is_preset_entry(ZNetwork::Testnet, &ours.id, &ours.url, &ours.operator));
     }
 
     #[test]
