@@ -99,7 +99,7 @@ fn route_table_over_a_direct_connection() {
     let p = v(node.set_proxy("regtest", GO_DIRECT));
     assert_eq!((p["proxy"].as_str(), &p["proxyRequired"]), (Some("direct"), &json!(false)));
     assert_eq!(node.route_table("regtest"), rt);
-    assert_eq!(v(node.route_table("mainnet"))["proxy"], "socks5h://127.0.0.1:9050");
+    assert_eq!(v(node.servers("mainnet"))["proxy"], "tor");
     let (targets, _) = node.poll_plan();
     assert!(targets.iter().any(|t| t.network == ZNetwork::Regtest && t.proxy == "direct" && t.url == "http://127.0.0.1:29061"));
 

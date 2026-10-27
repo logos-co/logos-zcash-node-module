@@ -1,12 +1,19 @@
-//! The proxy setting: Tor's SOCKS port. Only socks5h is accepted: plain socks5 resolves
-//! names locally, and http(s) proxies cannot isolate Tor circuits. `direct` means none: only
-//! servers on the user's network, and those the user set to skip Tor, are then reached.
+//! The proxy setting. `tor`, the default, is the built-in Tor (tor_module); otherwise the
+//! user's own Tor, as socks5h only: plain socks5 resolves names locally, and http(s) proxies
+//! cannot isolate Tor circuits. `direct` means none: only servers on the user's network, and
+//! those the user set to skip Tor, are then reached.
 
 use serde::Deserialize;
 
 use crate::net::socks::ProxyAddr;
 
-pub const DEFAULT_PROXY: &str = "socks5h://127.0.0.1:9050";
+/// The built-in Tor, dialled at the SOCKS port tor_module reports.
+pub const BUILT_IN: &str = "tor";
+
+pub const DEFAULT_PROXY: &str = BUILT_IN;
+
+/// The default before the built-in Tor: a Tor the user had to run.
+pub const OLD_DEFAULT_PROXY: &str = "socks5h://127.0.0.1:9050";
 
 /// No proxy, as the wallet core's routes name it.
 pub const DIRECT: &str = "direct";
@@ -41,11 +48,11 @@ pub fn parse_config(json: &str) -> Result<(Option<String>, bool), String> {
 }
 
 /// Normalizes a proxy URL to `socks5h://host:port`, refusing every other scheme, or
-/// to `direct`.
+/// to `direct` or `tor`.
 pub fn normalize(url: &str) -> Result<String, String> {
     let lower = url.trim().to_ascii_lowercase();
-    if lower == DIRECT {
-        return Ok(DIRECT.into());
+    if lower == DIRECT || lower == BUILT_IN {
+        return Ok(lower);
     }
     if lower.starts_with("socks5://") || lower.starts_with("socks4") || lower.starts_with("socks://") {
         return Err("socks5:// resolves names locally; use socks5h://host:port".into());
@@ -123,8 +130,15 @@ mod tests {
         assert_eq!(parse_config(direct).unwrap(), (Some(DIRECT.into()), false));
         assert_eq!(normalize(" Direct ").unwrap(), DIRECT);
         assert!(addr(DIRECT).unwrap().is_direct());
-        assert!(!addr(DEFAULT_PROXY).unwrap().is_direct());
+        assert!(!addr(OLD_DEFAULT_PROXY).unwrap().is_direct());
         // The sentinel cannot be reached through a proxy URL.
         assert!(normalize("socks5h://direct:0").is_err());
+    }
+
+    #[test]
+    fn tor_is_the_built_in_one() {
+        assert_eq!(DEFAULT_PROXY, BUILT_IN);
+        assert_eq!(normalize(" TOR ").unwrap(), BUILT_IN);
+        assert_eq!(parse_config(r#"{"proxy":"tor"}"#).unwrap(), (Some(BUILT_IN.into()), true));
     }
 }

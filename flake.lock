@@ -9629,6 +9629,7 @@
     "root": {
       "inputs": {
         "logos-module-builder": "logos-module-builder",
+        "tor_module": "tor_module",
         "zebrad_module": "zebrad_module"
       }
     },
@@ -9722,6 +9723,26 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "tor_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793113596,
+        "narHash": "sha256-VmZ8KMi/dndjsL3x7hlXVh6U3FOuNMaBtTBD5S/LwEI=",
+        "owner": "logos-co",
+        "repo": "logos-tor-module",
+        "rev": "6061449db5dacea1747c893e99342acc761b57f4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-tor-module",
         "type": "github"
       }
     },

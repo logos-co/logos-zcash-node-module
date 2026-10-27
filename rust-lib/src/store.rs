@@ -12,7 +12,7 @@ use crate::proxy::{self, DEFAULT_PROXY};
 use crate::servers::{self, preset_servers, Preset, Server, Source};
 
 pub const FILE_NAME: &str = "zcash_servers.json";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -128,7 +128,7 @@ impl Store {
             Ok(s) => s,
             Err(e) => return Loaded::Corrupt(e.to_string()),
         };
-        if store.version != VERSION {
+        if !(1..=VERSION).contains(&store.version) {
             return Loaded::Corrupt(format!("unknown version {}", store.version));
         }
         let kept = networks();
@@ -158,17 +158,31 @@ impl Store {
         std::fs::rename(&tmp, path)
     }
 
+    /// Version 1 seeded a Tor the user had to run; the built-in one takes its place, once.
+    pub fn upgrade(&mut self) -> bool {
+        if self.version == VERSION {
+            return false;
+        }
+        for cfg in self.networks.values_mut() {
+            if cfg.proxy.as_deref() == Some(proxy::OLD_DEFAULT_PROXY) {
+                cfg.proxy = Some(proxy::BUILT_IN.into());
+            }
+        }
+        self.version = VERSION;
+        true
+    }
+
     /// Loads the file, or seeds the presets when it is absent. A corrupt file is kept
-    /// aside as `<file>.corrupt` and replaced by the presets. Retired presets are dropped
-    /// and the file rewritten without them.
+    /// aside as `<file>.corrupt` and replaced by the presets. An older file is upgraded,
+    /// retired presets are dropped, and the file is rewritten.
     pub fn load_or_seed(path: &Path) -> Self {
         let store = match Self::load(path) {
             Loaded::Found(mut s) => {
-                let mut retired = false;
+                let mut changed = s.upgrade();
                 for (net, cfg) in s.networks.iter_mut() {
-                    retired |= cfg.retire_presets(*net);
+                    changed |= cfg.retire_presets(*net);
                 }
-                if !retired {
+                if !changed {
                     return s;
                 }
                 s
@@ -329,6 +343,22 @@ mod tests {
         assert!(test.suspects.is_empty());
         assert!(!std::fs::read_to_string(&path).unwrap().contains(&gone));
         assert!(matches!(Store::load(&path), Loaded::Found(s) if s == back));
+
+        // A version 1 file on the old default moves to the built-in Tor, once; a proxy the user
+        // chose stays.
+        let mut old = Store::seeded();
+        old.version = 1;
+        old.networks.get_mut(&ZNetwork::Mainnet).unwrap().proxy = Some(proxy::OLD_DEFAULT_PROXY.into());
+        old.networks.get_mut(&ZNetwork::Testnet).unwrap().proxy = Some("socks5h://127.0.0.1:9150".into());
+        old.save(&path).unwrap();
+        let up = Store::load_or_seed(&path);
+        assert_eq!(up.version, VERSION);
+        assert_eq!(up.networks[&ZNetwork::Mainnet].proxy.as_deref(), Some(proxy::BUILT_IN));
+        assert_eq!(up.networks[&ZNetwork::Testnet].proxy.as_deref(), Some("socks5h://127.0.0.1:9150"));
+        let mut chosen = up.clone();
+        chosen.networks.get_mut(&ZNetwork::Mainnet).unwrap().proxy = Some(proxy::OLD_DEFAULT_PROXY.into());
+        chosen.save(&path).unwrap();
+        assert_eq!(Store::load_or_seed(&path), chosen);
 
         // A list of nothing else falls back to the presets.
         let mut only = NetConfig::seeded(ZNetwork::Testnet);

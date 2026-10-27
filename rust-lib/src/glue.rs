@@ -7,7 +7,7 @@ use std::time::Duration;
 use logos_rust_sdk::{AboutToUnload, LogosCaller, Shutdown};
 
 use crate::gate::{Access, Caller, Callers};
-use crate::node::{Event, Node, Sink};
+use crate::node::{Event, Node, Sink, TorView};
 use crate::poll::Poller;
 use crate::reply;
 use crate::store::FILE_NAME;
@@ -21,14 +21,18 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     fn set_servers(&self, network: String, list_json: String) -> String;
     /// `two-operators`, `single` or `custom`; regtest has none. Backend only.
     fn apply_preset(&self, network: String, name: String) -> String;
-    /// `{ proxy, proxyRequired }`; the proxy must be socks5h://host:port, or `direct` on
-    /// regtest. Backend only.
+    /// `{ proxy, proxyRequired }`; the proxy is `tor` (the built-in Tor, the default), the
+    /// user's own as socks5h://host:port, or `direct` on regtest. Backend only.
     fn set_proxy(&self, network: String, config_json: String) -> String;
     /// `{ ok, network, proxy, proxyRequired, crossCheck, sync, details, taddr, broadcast,
-    /// mempool, tip }`, each class a list of `{ id, url, operator }`. Backend and wallet core.
+    /// mempool, tip }`, each class a list of `{ id, url, operator }`. `proxy` is what to dial
+    /// through: for `tor`, the built-in Tor's port, and an error until it is known. Backend
+    /// and wallet core.
     fn route_table(&self, network: String) -> String;
     /// `{ ok, network, overall, pending, servers: [{ id, reachable, rttMs, chain, branchId,
-    /// height, protocolVersion, lightwalletdVersion, vendor, suspect, lastError, checkedAt }] }`.
+    /// height, protocolVersion, lightwalletdVersion, vendor, suspect, lastError, checkedAt }],
+    /// tor }`; `tor` is the built-in Tor's `{ state, progress, detail }` when the network
+    /// uses it, else null.
     fn server_health(&self, network: String) -> String;
     /// Marks a server suspect until the backend clears it. Backend and wallet core.
     fn report_mismatch(&self, network: String, server_id: String, kind: String, height: i64) -> String;
@@ -61,6 +65,7 @@ pub struct ZcashNodeModuleImpl {
     // Qualified: the generated scaffold already imports `Mutex` into this module.
     callers: std::sync::Mutex<Callers>,
     poller: std::sync::Mutex<Option<Poller>>,
+    tor: std::sync::Mutex<Option<TorFollower>>,
 }
 
 impl ZcashNodeModuleImpl {
@@ -124,7 +129,7 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         self.gated(Access::Backend, |n| n.set_local_node(&network, enabled))
     }
 
-    /// Loads the servers and starts the health thread; the thread makes the calls.
+    /// Loads the servers and starts the Tor and health threads; the threads make the calls.
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();
@@ -144,10 +149,66 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         let node = Node::open(Some(dir.join(FILE_NAME)), sink);
         node.set_local_status(Arc::new(ZebradStatus::default()));
         if self.node.set(node.clone()).is_ok() {
+            match TorFollower::start(node.clone()) {
+                Ok(t) => *self.tor.lock().unwrap() = Some(t),
+                Err(e) => eprintln!("zcash_node_module: tor thread: {e}"),
+            }
             match Poller::start(node) {
                 Ok(p) => *self.poller.lock().unwrap() = Some(p),
                 Err(e) => eprintln!("zcash_node_module: health thread: {e}"),
             }
+        }
+    }
+}
+
+/// Bounds each status call, so unloading never waits on tor_module for long.
+const TOR_BUDGET: Duration = Duration::from_millis(1000);
+
+/// Follows tor_module, the built-in Tor: its status every 2 s until it is ready, then every
+/// 30 s. The call is async with a channel: a blocking one from this thread would run nested
+/// on the main thread.
+struct TorFollower {
+    stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TorFollower {
+    fn start(node: Arc<Node>) -> std::io::Result<Self> {
+        let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new().name("zcash_node_tor".into()).spawn(move || {
+            // One client: each new one opens its own connection.
+            let client = tor_module::TorModuleClient::new();
+            loop {
+                let (tx, rx) = std::sync::mpsc::channel();
+                client.status_async_with_timeout(TOR_BUDGET, move |r| {
+                    let _ = tx.send(r.map_err(|e| e.to_string()));
+                });
+                let reply = rx
+                    .recv_timeout(TOR_BUDGET + Duration::from_millis(200))
+                    .unwrap_or_else(|_| Err("tor_module did not answer".into()));
+                let view = TorView::from_reply(reply);
+                let every = Duration::from_secs(if view.state == "ready" { 30 } else { 2 });
+                node.set_tor(view);
+                let (lock, cvar) = &*flag;
+                let (stopped, _) = cvar.wait_timeout_while(lock.lock().unwrap(), every, |s| !*s).unwrap();
+                if *stopped {
+                    return;
+                }
+            }
+        })?;
+        Ok(Self { stop, thread: Some(thread) })
+    }
+
+    fn signal(&self) {
+        let (lock, cvar) = &*self.stop;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    fn join(mut self) {
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
 }
@@ -174,12 +235,20 @@ impl crate::node::LocalStatus for ZebradStatus {
 }
 
 impl AboutToUnload for ZcashNodeModuleImpl {
-    /// Stops the health thread, cancelling calls in flight, and joins it within ~1 s.
+    /// Stops the Tor and health threads, cancelling calls in flight, and joins them within
+    /// ~1.2 s: the Tor thread's last call runs out while the health thread stops.
     fn about_to_unload(&self) -> Shutdown {
+        let tor = self.tor.lock().unwrap().take();
+        if let Some(t) = &tor {
+            t.signal();
+        }
         if let Some(p) = self.poller.lock().unwrap().take() {
             if !p.stop(Duration::from_millis(1000)) {
                 eprintln!("zcash_node_module: health thread did not stop within 1 s");
             }
+        }
+        if let Some(t) = tor {
+            t.join();
         }
         Shutdown::Synchronous
     }
