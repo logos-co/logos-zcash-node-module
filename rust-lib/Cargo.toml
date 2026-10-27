@@ -19,13 +19,17 @@ zcash_client_backend = { version = "=0.25.0", default-features = false, features
 ] }
 zcash_protocol = { version = "=0.11.0", features = ["local-consensus"] }
 
-# Network: gRPC over a socks5h connector.
+# Network: gRPC over the built-in Tor's IPC requests, or a socks5h connector.
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "tls-webpki-roots", "codegen"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 tokio-socks = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
 http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.22"
 
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +43,7 @@ logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+prost = "0.14"
 
 [features]
 default = ["logos_module"]

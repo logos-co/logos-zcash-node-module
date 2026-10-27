@@ -31,6 +31,15 @@ impl ProxyAddr {
         self.host == "direct" && self.port == 0
     }
 
+    /// The built-in Tor, reached over Logos IPC rather than a port.
+    pub fn tor() -> Self {
+        Self { host: "tor".into(), port: 0 }
+    }
+
+    pub fn is_tor(&self) -> bool {
+        self.host == "tor" && self.port == 0
+    }
+
     pub fn parse(url: &str) -> Result<Self, String> {
         let rest = url
             .strip_prefix(SCHEME)
@@ -56,6 +65,11 @@ pub struct Isolation {
 }
 
 impl Isolation {
+    /// The key the built-in Tor isolates on: the same circuit as these credentials would get.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.user, self.pass)
+    }
+
     /// A circuit no other request will use.
     pub fn fresh() -> Self {
         let mut bytes = [0u8; 24];

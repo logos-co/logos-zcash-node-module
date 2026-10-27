@@ -5,11 +5,21 @@ use std::time::Duration;
 
 use http::Uri;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tower::ServiceExt;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
 use super::socks::{Isolation, ProxyAddr, Socks5hConnector};
+use super::tor::{TorChannel, TransportError};
 
-pub type Client = CompactTxStreamerClient<Channel>;
+/// A network channel or the built-in Tor's IPC, behind one type.
+pub type GrpcChannel =
+    tower::util::BoxCloneSyncService<http::Request<tonic::body::Body>, http::Response<tonic::body::Body>, TransportError>;
+
+pub type Client = CompactTxStreamerClient<GrpcChannel>;
+
+fn network(channel: Channel) -> GrpcChannel {
+    GrpcChannel::new(channel.map_err(|e| TransportError(Box::new(e))))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -23,6 +33,8 @@ pub enum NetError {
     NotLan(String),
     #[error("{0} is an onion service, which is reached through Tor only")]
     NeedsTor(String),
+    #[error("the built-in Tor is not available")]
+    NoTor,
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -67,7 +79,8 @@ pub fn is_lan_url(server: &str) -> bool {
 }
 
 /// Opens a TLS channel to `server` (https://host:port), or a plain one to an onion service,
-/// through the proxy, on the circuit `isolation` selects. A server on the user's network is
+/// through the proxy, on the circuit `isolation` selects: the built-in Tor over IPC, which
+/// does the TLS itself, or the user's own over SOCKS. A server on the user's network is
 /// dialled directly, as is an https server the user set to skip Tor (its target's proxy is direct).
 pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
     let uri: Uri = server.parse().map_err(|_| NetError::BadUrl(server.into()))?;
@@ -88,7 +101,7 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
                 return Err(NetError::NotLan(server.into()));
             }
         }
-        endpoint.connect().await.map_err(wrap)?
+        network(endpoint.connect().await.map_err(wrap)?)
     } else if proxy.is_direct() {
         // A server the user set to skip Tor: https only.
         if is_onion(&host) {
@@ -97,12 +110,17 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
         if !https {
             return Err(NetError::BadUrl(server.into()));
         }
-        endpoint.connect().await.map_err(wrap)?
+        network(endpoint.connect().await.map_err(wrap)?)
     } else {
         if !https && !is_onion(&host) {
             return Err(NetError::BadUrl(server.into()));
         }
-        endpoint.connect_with_connector(Socks5hConnector::new(proxy.clone(), isolation)).await.map_err(wrap)?
+        if proxy.is_tor() {
+            let tor = super::tor::tor().ok_or(NetError::NoTor)?;
+            GrpcChannel::new(TorChannel::new(tor, server, &isolation.key()))
+        } else {
+            network(endpoint.connect_with_connector(Socks5hConnector::new(proxy.clone(), isolation)).await.map_err(wrap)?)
+        }
     };
     Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024))
 }

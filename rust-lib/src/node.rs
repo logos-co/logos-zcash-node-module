@@ -19,20 +19,18 @@ use crate::servers::{self, preset_servers, CallClass, Preset, Route, Server, Sou
 use crate::store::{NetConfig, Store, Suspicion};
 
 pub const NO_PROXY: &str = "no proxy is set";
-pub const TOR_DOWN: &str = "the built-in Tor is not running";
 
-/// The proxy URL a network's servers are dialled through, `None` for none, or why the
-/// built-in Tor cannot be used yet.
-type Dial = Result<Option<String>, &'static str>;
+/// What a network's servers are reached through: `tor` (the built-in Tor, over IPC), the
+/// user's own Tor as a socks5h URL, `direct`, or nothing.
+type Dial = Option<String>;
 
 /// Why `s` cannot be dialled as configured, if it cannot. A server on the user's network, or one
 /// the user set to skip Tor, is reached directly; every other one needs the proxy.
 fn blocked(dial: &Dial, s: &Server) -> Option<&'static str> {
     match dial {
         _ if is_lan_url(&s.url) || s.direct => None,
-        Err(why) => Some(why),
-        Ok(Some(p)) if p != DIRECT => None,
-        Ok(_) => Some(NO_PROXY),
+        Some(p) if p != DIRECT => None,
+        _ => Some(NO_PROXY),
     }
 }
 
@@ -44,20 +42,19 @@ pub struct TorView {
     pub progress: u8,
     /// Why it is blocked or failed; empty otherwise, so progress alone does not churn events.
     pub detail: String,
-    pub socks: Option<String>,
 }
 
 impl TorView {
     /// tor_module's status() reply, or why there was none.
     pub fn from_reply(reply: Result<String, String>) -> Self {
-        let failed = |detail: String| Self { state: "failed".into(), progress: 0, detail, socks: None };
+        let failed = |detail: String| Self { state: "failed".into(), progress: 0, detail };
         let v: Value = match reply.and_then(|t| serde_json::from_str(&t).map_err(|e| format!("tor_module: {e}"))) {
             Ok(v) => v,
             Err(e) => return failed(e),
         };
         match v["error"].as_str() {
             _ if v["ok"] == true => {}
-            Some("starting") => return Self { state: "connecting".into(), progress: 0, detail: String::new(), socks: None },
+            Some("starting") => return Self { state: "connecting".into(), progress: 0, detail: String::new() },
             e => return failed(e.unwrap_or("tor_module answered without ok").into()),
         }
         // Asking starts an idle Tor, so idle is only ever a moment's answer.
@@ -70,7 +67,7 @@ impl TorView {
             _ => String::new(),
         };
         let progress = v["progress"].as_u64().unwrap_or(0).min(100) as u8;
-        Self { state, progress, detail, socks: v["socks"].as_str().map(str::to_string) }
+        Self { state, progress, detail }
     }
 }
 
@@ -152,12 +149,8 @@ impl Inner {
         }
     }
 
-    /// The built-in Tor's SOCKS port for `tor`, the configured proxy otherwise.
     fn dial(&self, cfg: &NetConfig) -> Dial {
-        match cfg.proxy.as_deref() {
-            Some(BUILT_IN) => self.tor.as_ref().and_then(|t| t.socks.clone()).map(Some).ok_or(TOR_DOWN),
-            p => Ok(p.map(str::to_string)),
-        }
+        cfg.proxy.clone()
     }
 
     fn forget_stale_health(&mut self, net: ZNetwork) {
@@ -181,10 +174,9 @@ impl Inner {
             return self.local_route_table(net, cfg, r.broadcast, &dial);
         }
         let proxy = match &dial {
-            Ok(Some(p)) => p.as_str(),
-            _ if !r.sync.is_empty() => DIRECT,
-            Ok(None) => return reply::err(NO_PROXY),
-            Err(why) => return reply::err(why),
+            Some(p) => p.as_str(),
+            None if !r.sync.is_empty() => DIRECT,
+            None => return reply::err(NO_PROXY),
         };
         let table = RouteTable {
             ok: true,
@@ -211,10 +203,9 @@ impl Inner {
         let senders: Vec<&Server> = cfg.servers.iter().filter(|s| s.enabled && s.classes.contains(&CallClass::Broadcast)).collect();
         let (broadcast, proxy) = match dial {
             _ if senders.is_empty() => (local.clone(), ""),
-            Ok(Some(p)) => (remote, p.as_str()),
-            _ if senders.iter().any(|s| is_lan_url(&s.url) || s.direct) => (remote, DIRECT),
-            Ok(None) => return reply::err(NO_PROXY),
-            Err(why) => return reply::err(why),
+            Some(p) => (remote, p.as_str()),
+            None if senders.iter().any(|s| is_lan_url(&s.url) || s.direct) => (remote, DIRECT),
+            None => return reply::err(NO_PROXY),
         };
         let table = RouteTable {
             ok: true,
@@ -401,8 +392,7 @@ impl Node {
                 return;
             }
             let was_ready = inner.tor.as_ref().is_some_and(|t| t.state == "ready");
-            let look_again =
-                inner.tor.as_ref().map(|t| &t.socks) != Some(&view.socks) || (!was_ready && view.state == "ready");
+            let look_again = !was_ready && view.state == "ready";
             inner.tor = Some(view);
             let events: Vec<Event> = networks().into_iter().flat_map(|net| inner.changes(net)).collect();
             (events, look_again)
@@ -548,7 +538,7 @@ impl Node {
             let dial = inner.dial(cfg);
             for s in cfg.servers.iter().filter(|s| s.enabled) {
                 let proxy = match &dial {
-                    Ok(Some(p)) if !s.direct => p.clone(),
+                    Some(p) if !s.direct => p.clone(),
                     _ => DIRECT.into(),
                 };
                 let t = Target { network: *net, id: s.id.clone(), url: s.url.clone(), proxy };
@@ -607,17 +597,14 @@ mod tests {
             log.lock().unwrap().push(line);
         });
         let node = Node::open(Some(dir.path().join(crate::store::FILE_NAME)), sink);
-        node.set_tor(tor_view("ready", Some(TOR)));
+        node.set_tor(tor_view("ready"));
         let h = Harness { node, events, _dir: dir };
         h.take();
         h
     }
 
-    /// The built-in Tor's port in these tests.
-    const TOR: &str = "socks5h://127.0.0.1:41000";
-
-    fn tor_view(state: &str, socks: Option<&str>) -> TorView {
-        TorView { state: state.into(), progress: 100, detail: String::new(), socks: socks.map(str::to_string) }
+    fn tor_view(state: &str) -> TorView {
+        TorView { state: state.into(), progress: 100, detail: String::new() }
     }
 
     impl Harness {
@@ -655,7 +642,7 @@ mod tests {
         }
         let broadcast = ids(&rt, "broadcast");
         assert_eq!(broadcast, ["testnet.zec.rocks"]);
-        assert_eq!((&rt["crossCheck"], &rt["proxy"]), (&json!(false), &json!(TOR)));
+        assert_eq!((&rt["crossCheck"], &rt["proxy"]), (&json!(false), &json!(BUILT_IN)));
         assert_eq!(v(h.node.servers("testnet"))["localNode"], true);
         // Suspect servers leave no broadcast route; the local node does not quietly take over.
         for id in &broadcast {
@@ -704,7 +691,7 @@ mod tests {
     fn route_table_shape_and_fail_closed() {
         let h = harness();
         let rt = h.node.route_table("testnet");
-        assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"socks5h://127.0.0.1:41000","proxyRequired":true,"crossCheck":false,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"}],"#), "{rt}");
+        assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"tor","proxyRequired":true,"crossCheck":false,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"}],"#), "{rt}");
         let keys: Vec<String> = v(rt).as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 12);
 
@@ -731,7 +718,7 @@ mod tests {
         for refused in [r#"{"proxy":"socks5://127.0.0.1:9050"}"#, r#"{"proxy":"http://127.0.0.1:8118"}"#, r#"{"proxy":"https://p:443"}"#] {
             assert_eq!(v(h.node.set_proxy("mainnet", refused))["ok"], false);
         }
-        assert_eq!(v(h.node.route_table("mainnet"))["proxy"], TOR);
+        assert_eq!(v(h.node.route_table("mainnet"))["proxy"], BUILT_IN);
         assert_eq!(v(h.node.route_table("regtest"))["error"], "network must be mainnet or testnet");
     }
 
@@ -927,7 +914,7 @@ mod tests {
         h.node.report_mismatch("mainnet", "zec.rocks", "block_hash", 10);
         let path = h._dir.path().join(crate::store::FILE_NAME);
         let again = Node::open(Some(path), Arc::new(|_| {}));
-        again.set_tor(tor_view("ready", Some(TOR)));
+        again.set_tor(tor_view("ready"));
         for net in ["mainnet", "testnet"] {
             assert_eq!(again.servers(net), h.node.servers(net));
             assert_eq!(again.route_table(net), h.node.route_table(net));
@@ -951,42 +938,39 @@ mod tests {
         });
         let node = Node::open(None, sink);
         assert_eq!(v(node.servers("testnet"))["proxy"], BUILT_IN);
-        // Until tor_module answers, servers that need Tor have no route and are not dialled.
-        assert_eq!(v(node.route_table("testnet"))["error"], TOR_DOWN);
+        // Routes name the built-in Tor before it answers: a request over IPC starts it.
+        assert_eq!(v(node.route_table("testnet"))["proxy"], BUILT_IN);
         let (targets, skipped) = node.poll_plan();
-        assert!(targets.is_empty() && skipped.iter().all(|(_, why)| *why == TOR_DOWN));
+        assert!(skipped.is_empty() && !targets.is_empty() && targets.iter().all(|t| t.proxy == BUILT_IN));
         assert_eq!(v(node.server_health("testnet"))["tor"]["state"], "connecting");
 
-        node.set_tor(TorView { state: "connecting".into(), progress: 40, detail: String::new(), socks: Some(TOR.into()) });
-        assert_eq!(*events.lock().unwrap(), ["routes mainnet", "health mainnet tor connecting", "routes testnet", "health testnet tor connecting"]);
-        assert_eq!(v(node.route_table("testnet"))["proxy"], TOR);
-        let (targets, _) = node.poll_plan();
-        assert!(!targets.is_empty() && targets.iter().all(|t| t.proxy == TOR));
+        node.set_tor(TorView { state: "connecting".into(), progress: 40, detail: String::new() });
+        assert_eq!(*events.lock().unwrap(), ["health mainnet tor connecting", "health testnet tor connecting"], "routes do not follow Tor's state");
         events.lock().unwrap().clear();
 
         // The poller looks again once Tor is ready, as its checks while joining timed out.
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let woke = || rt.block_on(async { tokio::time::timeout(std::time::Duration::from_millis(20), node.wake().notified()).await.is_ok() });
-        assert!(woke(), "the port became known");
-        node.set_tor(TorView { state: "connecting".into(), progress: 60, detail: String::new(), socks: Some(TOR.into()) });
+        node.set_tor(TorView { state: "connecting".into(), progress: 60, detail: String::new() });
         assert!(!woke());
-        node.set_tor(TorView { state: "ready".into(), progress: 100, detail: String::new(), socks: Some(TOR.into()) });
+        node.set_tor(TorView { state: "ready".into(), progress: 100, detail: String::new() });
         assert!(woke(), "Tor became ready");
-        node.set_tor(TorView { state: "connecting".into(), progress: 40, detail: String::new(), socks: Some(TOR.into()) });
+        node.set_tor(TorView { state: "connecting".into(), progress: 40, detail: String::new() });
         events.lock().unwrap().clear();
 
         // The same status again changes nothing; Tor blocked shows in health, not in routes.
-        node.set_tor(TorView { state: "connecting".into(), progress: 40, detail: String::new(), socks: Some(TOR.into()) });
-        node.set_tor(TorView { state: "blocked".into(), progress: 40, detail: "no network".into(), socks: Some(TOR.into()) });
+        node.set_tor(TorView { state: "connecting".into(), progress: 40, detail: String::new() });
+        node.set_tor(TorView { state: "blocked".into(), progress: 40, detail: "no network".into() });
         assert_eq!(*events.lock().unwrap(), ["health mainnet tor blocked", "health testnet tor blocked"]);
         assert_eq!(v(node.server_health("mainnet"))["tor"], json!({"state": "blocked", "progress": 40, "detail": "no network"}));
 
-        // Tor down: a server on the user's network is still reached, directly.
-        node.set_tor(TorView { state: "failed".into(), progress: 0, detail: "no port".into(), socks: None });
+        // Tor down: its servers keep their routes, and a server on the user's network is still
+        // reached directly.
+        node.set_tor(TorView { state: "failed".into(), progress: 0, detail: "no network".into() });
         node.set_servers("testnet", r#"[{"id":"home","url":"192.168.1.20","operator":"me"},
                                          {"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"}]"#);
         let rt = v(node.route_table("testnet"));
-        assert_eq!((ids(&rt, "sync"), rt["proxy"].as_str()), (vec!["home".to_string()], Some(DIRECT)));
+        assert_eq!((ids(&rt, "sync"), rt["proxy"].as_str()), (vec!["home".to_string(), "testnet.zec.rocks".to_string()], Some(BUILT_IN)));
 
         // The user's own Tor ignores the built-in one.
         node.set_proxy("mainnet", r#"{"proxy":"socks5h://127.0.0.1:9150","proxyRequired":true}"#);
@@ -1011,14 +995,14 @@ mod tests {
     #[test]
     fn tor_module_replies() {
         let ok = |s: &str| TorView::from_reply(Ok(s.into()));
-        let ready = ok(r#"{"ok":true,"state":"ready","progress":100,"detail":"fresh until 15:00","socks":"socks5h://127.0.0.1:5"}"#);
-        assert_eq!(ready, TorView { state: "ready".into(), progress: 100, detail: String::new(), socks: Some("socks5h://127.0.0.1:5".into()) });
+        let ready = ok(r#"{"ok":true,"state":"ready","progress":100,"detail":"fresh until 15:00","socks":null}"#);
+        assert_eq!(ready, TorView { state: "ready".into(), progress: 100, detail: String::new() });
         let blocked = ok(r#"{"ok":true,"state":"blocked","progress":30,"detail":"can't reach relays","socks":"socks5h://127.0.0.1:5"}"#);
         assert_eq!((blocked.state.as_str(), blocked.detail.as_str()), ("blocked", "can't reach relays"));
         assert_eq!(ok(r#"{"ok":false,"error":"starting"}"#).state, "connecting");
         assert_eq!(ok(r#"{"ok":true,"state":"idle","progress":0,"detail":"","socks":"socks5h://127.0.0.1:5"}"#).state, "connecting");
         let failed = ok(r#"{"ok":false,"error":"tor config: bad dir"}"#);
-        assert_eq!((failed.state.as_str(), failed.detail.as_str(), failed.socks), ("failed", "tor config: bad dir", None));
+        assert_eq!((failed.state.as_str(), failed.detail.as_str()), ("failed", "tor config: bad dir"));
         let unloaded = TorView::from_reply(Err("object_unavailable".into()));
         assert_eq!((unloaded.state.as_str(), unloaded.detail.as_str()), ("failed", "object_unavailable"));
     }

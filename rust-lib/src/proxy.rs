@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::net::socks::ProxyAddr;
 
-/// The built-in Tor, dialled at the SOCKS port tor_module reports.
+/// The built-in Tor, reached with requests to tor_module over Logos IPC.
 pub const BUILT_IN: &str = "tor";
 
 pub const DEFAULT_PROXY: &str = BUILT_IN;
@@ -79,6 +79,7 @@ pub fn normalize(url: &str) -> Result<String, String> {
 pub fn addr(proxy: &str) -> Result<ProxyAddr, String> {
     match proxy {
         DIRECT => Ok(ProxyAddr::direct()),
+        BUILT_IN => Ok(ProxyAddr::tor()),
         _ => ProxyAddr::parse(proxy),
     }
 }
