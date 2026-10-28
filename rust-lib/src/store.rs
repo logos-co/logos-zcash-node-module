@@ -35,13 +35,20 @@ pub struct NetConfig {
     /// Reads go to the local node (zebrad_module) over IPC; broadcasts stay on the servers.
     #[serde(default)]
     pub local_node: bool,
+    /// The preset hosts this list has been offered, so each new one is offered once.
+    #[serde(default)]
+    pub presets_seen: Vec<String>,
+}
+
+fn preset_ids(net: ZNetwork) -> Vec<String> {
+    preset_servers(net, Preset::TwoOperators).unwrap_or_default().into_iter().map(|s| s.id).collect()
 }
 
 impl NetConfig {
     pub fn seeded(net: ZNetwork) -> Self {
         // Regtest has no presets and no default proxy: the test harness sets both.
         if net == ZNetwork::Regtest {
-            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new(), local_node: false };
+            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new(), local_node: false, presets_seen: vec![] };
         }
         Self {
             preset: Preset::TwoOperators,
@@ -50,6 +57,7 @@ impl NetConfig {
             proxy_required: true,
             suspects: BTreeMap::new(),
             local_node: false,
+            presets_seen: preset_ids(net),
         }
     }
 
@@ -81,6 +89,49 @@ impl NetConfig {
             kept[0].enabled = true;
         }
         self.replace_servers(kept);
+        true
+    }
+
+    /// A preset replaces the list; servers the user added stay, disabled, and the user's
+    /// choice of Tor for a preset server outlives the preset. `custom` keeps the list.
+    pub fn apply_preset(&mut self, net: ZNetwork, preset: Preset) {
+        if let Some(mut list) = preset_servers(net, preset) {
+            for p in list.iter_mut() {
+                p.direct = self.servers.iter().any(|s| s.id == p.id && s.url == p.url && s.direct);
+            }
+            for s in self.servers.iter().filter(|s| s.source == Source::User) {
+                if list.len() < servers::MAX_SERVERS && !list.iter().any(|p| p.id == s.id || p.url == s.url) {
+                    list.push(Server { enabled: false, ..s.clone() });
+                }
+            }
+            self.replace_servers(list);
+            self.presets_seen = preset_ids(net);
+        }
+        self.preset = preset;
+    }
+
+    /// Offers each preset host this release adds once. A list still on a preset follows
+    /// it; a custom list gets the new hosts switched off, while it has room.
+    pub fn adopt_presets(&mut self, net: ZNetwork) -> bool {
+        let ids = preset_ids(net);
+        if ids == self.presets_seen {
+            return false;
+        }
+        if ids.iter().any(|id| !self.presets_seen.contains(id)) {
+            if self.preset != Preset::Custom {
+                self.apply_preset(net, self.preset);
+            } else {
+                let new = preset_servers(net, Preset::TwoOperators).unwrap_or_default();
+                for mut s in new.into_iter().filter(|s| !self.presets_seen.contains(&s.id)) {
+                    let taken = self.servers.iter().any(|x| x.id == s.id || x.url == s.url);
+                    if !taken && self.servers.len() < servers::MAX_SERVERS {
+                        s.enabled = false;
+                        self.servers.push(s);
+                    }
+                }
+            }
+        }
+        self.presets_seen = ids;
         true
     }
 
@@ -174,13 +225,14 @@ impl Store {
 
     /// Loads the file, or seeds the presets when it is absent. A corrupt file is kept
     /// aside as `<file>.corrupt` and replaced by the presets. An older file is upgraded,
-    /// retired presets are dropped, and the file is rewritten.
+    /// retired presets are dropped, new ones are offered once, and the file is rewritten.
     pub fn load_or_seed(path: &Path) -> Self {
         let store = match Self::load(path) {
             Loaded::Found(mut s) => {
                 let mut changed = s.upgrade();
                 for (net, cfg) in s.networks.iter_mut() {
                     changed |= cfg.retire_presets(*net);
+                    changed |= cfg.adopt_presets(*net);
                 }
                 if !changed {
                     return s;
@@ -327,9 +379,12 @@ mod tests {
             source,
             direct: false,
         };
-        // A preset an earlier release shipped, the only server in use, beside the user's own onion.
+        // An earlier release's list the user changed: a preset it shipped, the only server in
+        // use, beside the user's own onion, and without the presets this release adds.
         let mut store = Store::seeded();
         let test = store.networks.get_mut(&ZNetwork::Testnet).unwrap();
+        (test.preset, test.presets_seen) = (Preset::Custom, vec![]);
+        test.servers.truncate(1);
         test.servers[0].enabled = false;
         test.servers.push(entry(&gone, &gone, Source::Preset, true));
         test.servers.push(entry("mine", &mine, Source::User, false));
@@ -339,7 +394,8 @@ mod tests {
         let back = Store::load_or_seed(&path);
         let test = &back.networks[&ZNetwork::Testnet];
         let ids: Vec<_> = test.servers.iter().map(|s| (s.id.as_str(), s.enabled)).collect();
-        assert_eq!(ids, [("testnet.zec.rocks", true), ("mine", false)]);
+        let onion = "y64fwlthmsgxs7v4j37bv2spsp73vmfks5ypadelwyqr5cumenlt7cad.onion";
+        assert_eq!(ids, [("testnet.zec.rocks", true), ("mine", false), ("tl.ombie.cash", false), (onion, false)]);
         assert!(test.suspects.is_empty());
         assert!(!std::fs::read_to_string(&path).unwrap().contains(&gone));
         assert!(matches!(Store::load(&path), Loaded::Found(s) if s == back));
@@ -366,5 +422,67 @@ mod tests {
         assert!(only.retire_presets(ZNetwork::Testnet));
         assert_eq!(only.servers, preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap());
         assert!(!only.retire_presets(ZNetwork::Testnet));
+    }
+
+    #[test]
+    fn each_new_preset_is_offered_once() {
+        // Lists from the release before Cake Wallet and ZombieCash, which kept no presetsSeen.
+        let earlier = |net, preset| {
+            let mut cfg = NetConfig::seeded(net);
+            cfg.servers.retain(|s| !["Cake Wallet", "ZombieCash"].contains(&s.operator.as_str()));
+            (cfg.preset, cfg.presets_seen) = (preset, vec![]);
+            cfg
+        };
+        // A list still on its preset follows it, keeping the user's Tor choice.
+        let mut t = earlier(ZNetwork::Testnet, Preset::TwoOperators);
+        t.servers[0].direct = true;
+        assert!(t.adopt_presets(ZNetwork::Testnet));
+        let got: Vec<_> = t.servers.iter().map(|s| (s.id.as_str(), s.enabled, s.direct)).collect();
+        let onion = "y64fwlthmsgxs7v4j37bv2spsp73vmfks5ypadelwyqr5cumenlt7cad.onion";
+        assert_eq!(got, [("testnet.zec.rocks", true, true), ("tl.ombie.cash", true, false), (onion, false, false)]);
+        assert!(!t.adopt_presets(ZNetwork::Testnet));
+        let mut single = earlier(ZNetwork::Testnet, Preset::Single);
+        single.adopt_presets(ZNetwork::Testnet);
+        assert_eq!(single.servers.iter().filter(|s| s.enabled).count(), 1);
+
+        // A list the user changed keeps their choices; the new host joins switched off.
+        let mut m = earlier(ZNetwork::Mainnet, Preset::Custom);
+        m.servers[0].enabled = false;
+        m.servers[1].enabled = true;
+        let before = m.servers.clone();
+        assert!(m.adopt_presets(ZNetwork::Mainnet));
+        assert_eq!(m.servers[..before.len()], before[..]);
+        let cake = m.servers.last().unwrap();
+        assert_eq!((cake.id.as_str(), cake.enabled, cake.source), ("zec-node.cakewallet.com", false, Source::Preset));
+        m.validate(ZNetwork::Mainnet).unwrap();
+        // Offered once: a preset host the user removes stays removed.
+        m.servers.retain(|s| s.id != "zec-node.cakewallet.com");
+        assert!(!m.adopt_presets(ZNetwork::Mainnet));
+
+        // A url the user already added stays theirs; a full list takes nothing.
+        let user = |id: &str, url: &str| Server {
+            id: id.into(),
+            url: url.into(),
+            operator: "me".into(),
+            label: id.into(),
+            enabled: true,
+            classes: vec![CallClass::Sync],
+            source: Source::User,
+            direct: false,
+        };
+        let mut mine = earlier(ZNetwork::Mainnet, Preset::Custom);
+        mine.servers.push(user("cake", "https://zec-node.cakewallet.com:443"));
+        let before = mine.servers.clone();
+        mine.adopt_presets(ZNetwork::Mainnet);
+        assert_eq!(mine.servers, before);
+        let mut full = earlier(ZNetwork::Mainnet, Preset::Custom);
+        for i in full.servers.len()..servers::MAX_SERVERS {
+            full.servers.push(user(&format!("s{i}"), &format!("https://s{i}.example:443")));
+        }
+        let before = full.servers.clone();
+        full.adopt_presets(ZNetwork::Mainnet);
+        assert_eq!(full.servers, before);
+        full.validate(ZNetwork::Mainnet).unwrap();
+        assert!(!NetConfig::seeded(ZNetwork::Regtest).adopt_presets(ZNetwork::Regtest));
     }
 }
