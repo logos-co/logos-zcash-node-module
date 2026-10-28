@@ -57,10 +57,9 @@ fn every_preset_host_answers() {
             answered.push((*net, s.operator.clone()));
         }
     }
-    assert!(answered.contains(&(ZNetwork::Testnet, "zec.rocks".into())), "testnet.zec.rocks");
-    assert!(answered.contains(&(ZNetwork::Testnet, "logos".into())), "our testnet onion server");
-    for op in ["zec.rocks", "stardust"] {
-        assert!(answered.contains(&(ZNetwork::Mainnet, op.into())), "no mainnet {op} host answered");
+    // Every preset operator answers on at least one of its hosts.
+    for (net, s, ..) in &results {
+        assert!(answered.contains(&(*net, s.operator.clone())), "no {} {} host answered", net.name(), s.operator);
     }
 }
 

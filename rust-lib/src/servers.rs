@@ -81,8 +81,8 @@ impl Host {
     }
 }
 
-// Ports verified over Tor with GetLightdInfo (see tests/live.rs). The first host of
-// each operator is the one the presets enable; the rest are failover candidates.
+// Ports verified over Tor with GetLightdInfo (see tests/live.rs). The presets enable the
+// first host of the first two operators; the rest wait switched off.
 const MAINNET: &[Host] = &[
     h("zec.rocks", 443, "zec.rocks", "zec.rocks"),
     h("na.zec.rocks", 443, "zec.rocks", "zec.rocks North America"),
@@ -91,12 +91,15 @@ const MAINNET: &[Host] = &[
     h("ap.zec.rocks", 443, "zec.rocks", "zec.rocks Asia-Pacific"),
     h("us.zec.stardust.rest", 443, "stardust", "Stardust US"),
     h("eu.zec.stardust.rest", 443, "stardust", "Stardust EU"),
+    // Cake Wallet's own default server.
+    h("zec-node.cakewallet.com", 443, "Cake Wallet", "Cake Wallet"),
 ];
 
 const TESTNET: &[Host] = &[
     h("testnet.zec.rocks", 443, "zec.rocks", "zec.rocks testnet"),
-    // Ours: zebrad and lightwalletd behind an onion service, the testnet's second operator.
-    h("cnphkglrgl6xb4bz4zukbntfimrdqk3u4rf4mys2vhrvc73w3ulhb4id.onion", 9067, "logos", "Logos testnet (onion)"),
+    // The testnet's second operator, also behind an onion service.
+    h("tl.ombie.cash", 443, "ZombieCash", "ZombieCash testnet"),
+    h("y64fwlthmsgxs7v4j37bv2spsp73vmfks5ypadelwyqr5cumenlt7cad.onion", 80, "ZombieCash", "ZombieCash testnet (onion)"),
 ];
 
 fn hosts(net: ZNetwork) -> &'static [Host] {
@@ -122,7 +125,7 @@ pub fn preset_servers(net: ZNetwork, preset: Preset) -> Option<Vec<Server>> {
                 operators.push(host.operator);
             }
             let enabled = match preset {
-                Preset::TwoOperators => first_of_operator,
+                Preset::TwoOperators => first_of_operator && operators.len() <= 2,
                 _ => i == 0,
             };
             Server {
@@ -144,6 +147,11 @@ fn is_preset_entry(net: ZNetwork, id: &str, url: &str, operator: &str) -> bool {
     hosts(net)
         .iter()
         .any(|h| h.host == id && h.url() == url && h.operator == operator)
+}
+
+/// Whether this release still ships a preset host with this id.
+pub fn is_preset_host(net: ZNetwork, id: &str) -> bool {
+    hosts(net).iter().any(|h| h.host == id)
 }
 
 /// One entry of set_servers' list. `source` is accepted for round trips but recomputed.
@@ -365,9 +373,12 @@ mod tests {
     fn mainnet_two_operators() {
         let list = preset_servers(ZNetwork::Mainnet, Preset::TwoOperators).unwrap();
         validate(ZNetwork::Mainnet, &list).unwrap();
-        assert_eq!(list.len(), 7);
+        assert_eq!(list.len(), 8);
+        // Only the first two operators start enabled: Cake Wallet waits switched off.
         let enabled: Vec<&str> = list.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect();
         assert_eq!(enabled, ["zec.rocks", "us.zec.stardust.rest"]);
+        let cake = list.iter().find(|s| s.operator == "Cake Wallet").unwrap();
+        assert_eq!((cake.url.as_str(), cake.enabled), ("https://zec-node.cakewallet.com:443", false));
         assert!(list.iter().all(|s| s.source == Source::Preset && s.classes == ALL_CLASSES && s.url.ends_with(":443")));
         let r = routes(&list, all);
         assert_eq!(ids(&r.sync), ["zec.rocks", "us.zec.stardust.rest"]);
@@ -387,11 +398,16 @@ mod tests {
         assert_eq!(ids(&r.sync), ["testnet.zec.rocks"]);
         assert_eq!(r.sync[0].url, "https://testnet.zec.rocks:443");
         assert!(!r.cross_check);
-        // Testnet's two operators: zec.rocks, and ours behind an onion service.
+        // Testnet's two operators: zec.rocks and ZombieCash, whose onion service waits switched off.
         let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
+        validate(ZNetwork::Testnet, &t).unwrap();
+        let enabled: Vec<&str> = t.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect();
+        assert_eq!(enabled, ["testnet.zec.rocks", "tl.ombie.cash"]);
+        let onion = t.iter().find(|s| s.url.starts_with("http://")).unwrap();
+        assert_eq!((onion.operator.as_str(), onion.enabled), ("ZombieCash", false));
+        assert!(onion.url.ends_with(".onion:80"));
         let r = routes(&t, all);
-        assert_eq!(r.sync.len(), 2);
-        assert!(r.sync.iter().any(|s| s.url.starts_with("http://") && s.url.ends_with(".onion:9067")));
+        assert_eq!(ids(&r.sync), ["testnet.zec.rocks", "tl.ombie.cash"]);
         assert!(r.cross_check);
         assert!(preset_servers(ZNetwork::Mainnet, Preset::Custom).is_none());
         assert_eq!(Preset::parse("two-operators"), Some(Preset::TwoOperators));
@@ -415,19 +431,20 @@ mod tests {
             direct: false,
         });
         let r = routes(&list, all);
-        assert_eq!(ids(&r.sync), ["zec.rocks", "us.zec.stardust.rest", "mine"]);
+        let cake = "zec-node.cakewallet.com";
+        assert_eq!(ids(&r.sync), ["zec.rocks", "us.zec.stardust.rest", cake, "mine"]);
         assert_eq!(
             ids(&r.details),
-            ["zec.rocks", "us.zec.stardust.rest", "na.zec.rocks", "eu.zec.stardust.rest", "sa.zec.rocks", "eu.zec.rocks", "ap.zec.rocks"]
+            ["zec.rocks", "us.zec.stardust.rest", cake, "na.zec.rocks", "eu.zec.stardust.rest", "sa.zec.rocks", "eu.zec.rocks", "ap.zec.rocks"]
         );
-        assert_eq!(ids(&r.tip)[..4], ["zec.rocks", "us.zec.stardust.rest", "mine", "na.zec.rocks"]);
+        assert_eq!(ids(&r.tip)[..5], ["zec.rocks", "us.zec.stardust.rest", cake, "mine", "na.zec.rocks"]);
         assert!(!ids(&r.broadcast).contains(&"mine"));
         assert!(r.cross_check);
         // An unusable host gives way to the operator's next enabled one.
         let r = routes(&list, |s| s.id != "zec.rocks");
-        assert_eq!(ids(&r.sync), ["na.zec.rocks", "us.zec.stardust.rest", "mine"]);
+        assert_eq!(ids(&r.sync), ["na.zec.rocks", "us.zec.stardust.rest", cake, "mine"]);
         // Operators compare case-insensitively.
-        list.iter_mut().filter(|s| s.operator == "stardust").for_each(|s| s.operator = "zec.ROCKS".into());
+        list.iter_mut().filter(|s| s.operator != "zec.rocks").for_each(|s| s.operator = "zec.ROCKS".into());
         list.retain(|s| s.id != "mine");
         let r = routes(&list, all);
         assert_eq!(r.sync.len(), 1);
@@ -486,11 +503,11 @@ mod tests {
         assert_eq!(normalize_url(&format!("{onion}:9067")).unwrap(), format!("http://{onion}:9067"));
         // A retired v2 name is not an onion service the wallet takes.
         assert!(normalize_url("http://expyuzz4wqqyqhjn.onion:80").unwrap_err().contains("plain http"));
-        // The preset entry round-trips as a preset.
+        // The preset onion service round-trips as a preset.
         let t = preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap();
-        let ours = t.iter().find(|s| s.operator == "logos").unwrap();
-        assert_eq!(normalize_url(&ours.url).unwrap(), ours.url);
-        assert!(is_preset_entry(ZNetwork::Testnet, &ours.id, &ours.url, &ours.operator));
+        let o = t.iter().find(|s| s.id.ends_with(".onion")).unwrap();
+        assert_eq!(normalize_url(&o.url).unwrap(), o.url);
+        assert!(is_preset_entry(ZNetwork::Testnet, &o.id, &o.url, &o.operator));
     }
 
     #[test]

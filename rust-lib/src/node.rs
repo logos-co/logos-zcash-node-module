@@ -15,7 +15,7 @@ use crate::net::client::is_lan_url;
 use crate::network::{networks, ZNetwork};
 use crate::proxy::{self, DIRECT};
 use crate::reply;
-use crate::servers::{self, preset_servers, CallClass, Preset, Route, Server, Source, MAX_SERVERS};
+use crate::servers::{self, CallClass, Preset, Route, Server};
 use crate::store::{NetConfig, Store, Suspicion};
 
 pub const NO_PROXY: &str = "no proxy is set";
@@ -345,19 +345,7 @@ impl Node {
             return reply::err("preset must be two-operators, single or custom");
         };
         self.mutate(net, true, |cfg| {
-            if let Some(mut list) = preset_servers(net, preset) {
-                // The user's choice of Tor for a preset server outlives the preset.
-                for p in list.iter_mut() {
-                    p.direct = cfg.servers.iter().any(|s| s.id == p.id && s.url == p.url && s.direct);
-                }
-                for s in cfg.servers.iter().filter(|s| s.source == Source::User) {
-                    if list.len() < MAX_SERVERS && !list.iter().any(|p| p.id == s.id || p.url == s.url) {
-                        list.push(Server { enabled: false, ..s.clone() });
-                    }
-                }
-                cfg.replace_servers(list);
-            }
-            cfg.preset = preset;
+            cfg.apply_preset(net, preset);
             Ok((servers_reply(net, cfg), vec![]))
         })
     }
@@ -548,7 +536,7 @@ mod tests {
             assert_eq!(rt[class][0]["url"], LOCAL_NODE_URL, "{class}");
         }
         let broadcast = ids(&rt, "broadcast");
-        assert_eq!(broadcast.len(), 2, "both operators");
+        assert_eq!(broadcast, ["testnet.zec.rocks", "tl.ombie.cash"]);
         assert_eq!((&rt["crossCheck"], &rt["proxy"]), (&json!(false), &json!("socks5h://127.0.0.1:9050")));
         assert_eq!(v(h.node.servers("testnet"))["localNode"], true);
         // Suspect servers leave no broadcast route; the local node does not quietly take over.
@@ -598,7 +586,7 @@ mod tests {
     fn route_table_shape_and_fail_closed() {
         let h = harness();
         let rt = h.node.route_table("testnet");
-        assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true,"crossCheck":true,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"},{"id":"#), "{rt}");
+        assert!(rt.starts_with(r#"{"ok":true,"network":"testnet","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true,"crossCheck":true,"sync":[{"id":"testnet.zec.rocks","url":"https://testnet.zec.rocks:443","operator":"zec.rocks"},{"id":"tl.ombie.cash","url":"https://tl.ombie.cash:443","operator":"ZombieCash"}],"#), "{rt}");
         let keys: Vec<String> = v(rt).as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 12);
 
@@ -666,18 +654,20 @@ mod tests {
         assert_eq!((ids(&rt, "broadcast"), rt["proxy"].as_str()), (vec!["home".to_string()], Some(DIRECT)));
         h.node.set_local_node("testnet", false);
 
-        // Tor per server: zec.rocks skips it, the onion service keeps it.
+        // Tor per server: zec.rocks skips it, an onion service keeps it.
         h.node.apply_preset("testnet", "two-operators");
         let tor = r#"{"proxy":"socks5h://127.0.0.1:9050","proxyRequired":true}"#;
         h.node.set_proxy("testnet", tor);
         let mut list = v(h.node.servers("testnet"))["servers"].clone();
-        let onion = list.as_array().unwrap().iter().find(|s| s["id"].as_str().unwrap().ends_with(".onion")).unwrap()["id"].clone();
+        let onion = json!("onion");
+        let url = format!("http://{}.onion:9067", "a2".repeat(28));
+        list.as_array_mut().unwrap().push(json!({ "id": onion, "url": url, "operator": "them" }));
         for s in list.as_array_mut().unwrap().iter_mut().filter(|s| s["id"] == "testnet.zec.rocks") {
             s["direct"] = json!(true);
         }
         assert_eq!(v(h.node.set_servers("testnet", &list.to_string()))["ok"], true);
         let rt = v(h.node.route_table("testnet"));
-        assert_eq!((ids(&rt, "sync").len(), &rt["direct"]), (2, &json!(["https://testnet.zec.rocks:443"])));
+        assert_eq!((ids(&rt, "sync").len(), &rt["direct"]), (3, &json!(["https://testnet.zec.rocks:443"])));
         assert_eq!(rt["proxy"], "socks5h://127.0.0.1:9050");
         let (targets, _) = h.node.poll_plan();
         let proxy_of = |id: &Value| targets.iter().find(|t| t.network == ZNetwork::Testnet && t.id == *id).unwrap().proxy.clone();
@@ -685,12 +675,14 @@ mod tests {
         // The choice outlives re-applying the preset.
         h.node.apply_preset("testnet", "two-operators");
         assert_eq!(v(h.node.route_table("testnet"))["direct"], json!(["https://testnet.zec.rocks:443"]));
-        // Without a proxy, the server that skips Tor is still routed, and the onion service is not.
+        // Without a proxy, the server that skips Tor is still routed, and the ones on Tor are not.
+        assert_eq!(v(h.node.set_servers("testnet", &list.to_string()))["ok"], true);
         h.node.set_proxy("testnet", r#"{"proxy":null,"proxyRequired":false}"#);
         let rt = v(h.node.route_table("testnet"));
         assert_eq!((ids(&rt, "sync"), rt["proxy"].as_str()), (vec!["testnet.zec.rocks".to_string()], Some(DIRECT)));
         let (_, skipped) = h.node.poll_plan();
-        assert!(skipped.len() == 1 && json!(skipped[0].0.id) == onion && skipped[0].1 == NO_PROXY);
+        let skipped: Vec<_> = skipped.iter().map(|(t, why)| (json!(t.id), *why)).collect();
+        assert_eq!(skipped, [(json!("tl.ombie.cash"), NO_PROXY), (onion.clone(), NO_PROXY)]);
         // An onion service is reached through Tor only.
         for s in list.as_array_mut().unwrap().iter_mut().filter(|s| s["id"] == onion) {
             s["direct"] = json!(true);
@@ -719,21 +711,23 @@ mod tests {
         // A preset brings its hosts back and keeps the user's server, disabled.
         let s = v(h.node.apply_preset("mainnet", "two-operators"));
         let list = s["servers"].as_array().unwrap();
-        assert_eq!(list.len(), 8);
-        assert_eq!((list[7]["id"].as_str(), &list[7]["enabled"]), (Some("mine"), &json!(false)));
+        assert_eq!(list.len(), 9);
+        assert_eq!((list[8]["id"].as_str(), &list[8]["enabled"]), (Some("mine"), &json!(false)));
         assert_eq!(ids(&v(h.node.route_table("mainnet")), "sync"), ["zec.rocks", "us.zec.stardust.rest"]);
         // `custom` keeps the list as it is.
         let s = v(h.node.apply_preset("mainnet", "custom"));
-        assert_eq!((s["preset"].as_str(), s["servers"].as_array().unwrap().len()), (Some("custom"), 8));
+        assert_eq!((s["preset"].as_str(), s["servers"].as_array().unwrap().len()), (Some("custom"), 9));
 
+        assert_eq!(v(h.node.route_table("mainnet"))["crossCheck"], true);
+        // Testnet's two operators check each other; `single` has nothing to cross-check.
         let t = v(h.node.apply_preset("testnet", "two-operators"));
-        assert_eq!(t["servers"].as_array().unwrap().len(), 2);
+        assert_eq!(t["servers"].as_array().unwrap().len(), 3);
         assert_eq!(v(h.node.route_table("testnet"))["crossCheck"], true);
         h.node.apply_preset("testnet", "single");
         assert_eq!(v(h.node.route_table("testnet"))["crossCheck"], false);
         assert_eq!(v(h.node.apply_preset("testnet", "three"))["ok"], false);
         assert_eq!(v(h.node.set_servers("mainnet", r#"[{"id":"x","url":"http://x:1","operator":"o"}]"#))["ok"], false);
-        assert_eq!(v(h.node.servers("mainnet"))["servers"].as_array().unwrap().len(), 8);
+        assert_eq!(v(h.node.servers("mainnet"))["servers"].as_array().unwrap().len(), 9);
     }
 
     #[test]

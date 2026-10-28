@@ -10,11 +10,17 @@ have a route: everything else fails closed.
 
 | Preset | Mainnet | Testnet |
 |---|---|---|
-| `two-operators` (default) | zec.rocks and Stardust, one host each | testnet.zec.rocks and ours, an onion service |
+| `two-operators` (default) | zec.rocks and Stardust, one host each | testnet.zec.rocks and ZombieCash |
 | `single` | zec.rocks | testnet.zec.rocks |
 | `custom` | your list (`set_servers`) | your list |
 
-The other zec.rocks and Stardust hosts stay in the list, disabled, as failover candidates.
+The default enables the first host of the first two operators. The other hosts stay in the
+list, switched off: zec.rocks's and Stardust's other regions and Cake Wallet's server on
+mainnet, and ZombieCash's onion service on testnet.
+
+A preset host a later release drops leaves saved lists when they load; the user's own
+servers stay. A host it adds is offered once: a list still on its preset follows it, keeping
+the user's Tor choices, and a `custom` list gets the host switched off.
 
 ## Servers and Tor
 
