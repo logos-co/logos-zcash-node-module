@@ -109,6 +109,8 @@ struct Inner {
     sent_routes: HashMap<ZNetwork, String>,
     /// None until tor_module first answered.
     tor: Option<TorView>,
+    /// Whose servers the poller checks.
+    watch: Watch,
 }
 
 pub fn now() -> u64 {
@@ -136,9 +138,25 @@ struct RouteTable<'a> {
     direct: Vec<String>,
 }
 
+/// Every network until a backend says which one a wallet is open on, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    All,
+    Only(ZNetwork),
+    Nothing,
+}
+
 impl Inner {
     fn cfg(&self, net: ZNetwork) -> &NetConfig {
         &self.store.networks[&net]
+    }
+
+    fn watching(&self, net: ZNetwork) -> bool {
+        match self.watch {
+            Watch::All => true,
+            Watch::Only(n) => n == net,
+            Watch::Nothing => false,
+        }
     }
 
     /// The health measured for `s` at its current url, if it is enabled.
@@ -314,7 +332,7 @@ impl Node {
             Some(p) => Store::load_or_seed(p),
             None => Store::seeded(),
         };
-        let mut inner = Inner { store, health: HashMap::new(), sent_health: HashMap::new(), sent_routes: HashMap::new(), tor: None };
+        let mut inner = Inner { store, health: HashMap::new(), sent_health: HashMap::new(), sent_routes: HashMap::new(), tor: None, watch: Watch::All };
         for net in networks() {
             let _ = inner.changes(net);
         }
@@ -375,11 +393,26 @@ impl Node {
         servers_reply(net, self.lock().cfg(net))
     }
 
-    /// Whether a network goes through the built-in Tor: only then is tor_module asked, and
-    /// asking is what starts it.
+    /// The network a wallet is open on, or "" for none: only its servers are checked, and only
+    /// it keeps tor_module asked. Until a backend says, every network is.
+    pub fn watch(&self, network: &str) -> String {
+        let watch = match network {
+            "" => Watch::Nothing,
+            n => match ZNetwork::parse(n) {
+                Some(net) => Watch::Only(net),
+                None => return reply::err("network must be mainnet, testnet, regtest or empty"),
+            },
+        };
+        self.lock().watch = watch;
+        self.wake.notify_one();
+        reply::ok(json!({"watching": (!network.is_empty()).then_some(network)}))
+    }
+
+    /// Whether a watched network goes through the built-in Tor: only then is tor_module asked,
+    /// and asking is what starts it.
     pub fn uses_built_in_tor(&self) -> bool {
         let inner = self.lock();
-        networks().into_iter().any(|n| inner.cfg(n).proxy.as_deref() == Some(BUILT_IN))
+        networks().into_iter().any(|n| inner.watching(n) && inner.cfg(n).proxy.as_deref() == Some(BUILT_IN))
     }
 
     /// tor_module's latest status. Routes and health follow it. The poller looks again when
@@ -517,12 +550,12 @@ impl Node {
         }
     }
 
-    /// The enabled servers to poll, and those that cannot be dialled as configured, with why.
-    /// Nothing is dialled for those: they read unreachable.
+    /// The watched networks' enabled servers to poll, and those that cannot be dialled as
+    /// configured, with why. Nothing is dialled for those: they read unreachable.
     pub fn poll_plan(&self) -> (Vec<Target>, Vec<(Target, &'static str)>) {
         let inner = self.lock();
         let (mut targets, mut skipped) = (Vec::new(), Vec::new());
-        for (net, cfg) in &inner.store.networks {
+        for (net, cfg) in inner.store.networks.iter().filter(|(n, _)| inner.watching(**n)) {
             let dial = inner.dial(cfg);
             for s in cfg.servers.iter().filter(|s| s.enabled) {
                 let proxy = match &dial {
@@ -996,5 +1029,21 @@ mod tests {
         assert_eq!((failed.state.as_str(), failed.detail.as_str()), ("failed", "tor config: bad dir"));
         let unloaded = TorView::from_reply(Err("object_unavailable".into()));
         assert_eq!((unloaded.state.as_str(), unloaded.detail.as_str()), ("failed", "object_unavailable"));
+    }
+
+    #[test]
+    fn only_the_watched_network_is_polled() {
+        let h = harness();
+        let polled = |n: &Node| n.poll_plan().0.iter().map(|t| t.network.name()).collect::<std::collections::BTreeSet<_>>();
+        // Until a backend says, every network.
+        assert_eq!(polled(&h.node), ["mainnet", "testnet"].into());
+        assert!(h.node.uses_built_in_tor());
+        assert_eq!(v(h.node.watch("testnet"))["watching"], "testnet");
+        assert_eq!(polled(&h.node), ["testnet"].into());
+        // No wallet open: no server is asked, and tor_module is left to idle.
+        assert_eq!(v(h.node.watch(""))["watching"], Value::Null);
+        assert!(polled(&h.node).is_empty() && h.node.poll_plan().1.is_empty());
+        assert!(!h.node.uses_built_in_tor());
+        assert_eq!(v(h.node.watch("moonnet"))["ok"], false);
     }
 }

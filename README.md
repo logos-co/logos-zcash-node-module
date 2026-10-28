@@ -1,8 +1,10 @@
 # logos-zcash-node-module
 
 `zcash_node_module`: the lightwalletd servers a Zcash wallet talks to, per network. It keeps
-the server list and the proxy, answers a route table for each kind of call, and polls every
-enabled server's health over Tor. The proxy is the Tor that comes with Logos
+the server list and the proxy, answers a route table for each kind of call, and checks the
+enabled servers of the network a wallet is open on every 60 s, over Tor. The backend says which
+network with `watch(network)`, and `watch("")` when the wallet closes; until it does, every
+network's servers are checked. The proxy is the Tor that comes with Logos
 ([`tor_module`](https://github.com/logos-co/logos-tor-module)), reached over IPC, unless the
 user picks their own. Servers on the user's own network are reached directly, and the user may set any https
 server to skip Tor. With no proxy only those servers have a route: everything else fails
@@ -56,10 +58,10 @@ on one client share a circuit and an HTTP/2 connection, as they would one connec
 through a SOCKS proxy; another client gets its own.
 - The route table names it as the proxy `tor`, so the wallet core reaches it over IPC too.
   A request starts Tor if it has not, so servers keep their routes while Tor joins.
-- While a network uses it, a thread asks it for its status every 2 s until Tor is ready,
-  then every 30 s, and `server_health` carries its `{ state, progress, detail }` as `tor`:
+- While the watched network uses it, a thread asks it for its status every 2 s until Tor is
+  ready, then every 30 s, and `server_health` carries its `{ state, progress, detail }` as `tor`:
   `connecting`, `ready`, `blocked` or `failed`. With every network on the user's own Tor,
-  or on none, nothing is asked and the built-in Tor never connects.
+  or on none, or with no wallet open, nothing is asked and the built-in Tor never connects.
 - The poller looks again when Tor becomes ready, since checks made while it joined timed out.
 - The user's own Tor is set as `socks5h://host:port`, such as a system Tor at
   `socks5h://127.0.0.1:9050` or Tor Browser at `socks5h://127.0.0.1:9150`.
@@ -83,10 +85,10 @@ Regtest has no presets and starts with no servers and no proxy. Its lightwalletd
 
 ## Callers
 
-Only `zcash_wallet_backend` may change the list, the preset or the proxy, or clear a suspect
-server. The backend and `zcash_wallet_core_module` may read routes and report a mismatch,
-which marks a server suspect until the backend clears it. Events: `server_health_changed`,
-`routes_changed`, `server_suspect`.
+Only `zcash_wallet_backend` may change the list, the preset or the proxy, clear a suspect
+server, or say which network a wallet is open on. The backend and `zcash_wallet_core_module`
+may read routes and report a mismatch, which marks a server suspect until the backend clears
+it. Events: `server_health_changed`, `routes_changed`, `server_suspect`.
 
 ```bash
 cd rust-lib && cargo test --no-default-features
