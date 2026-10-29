@@ -44,6 +44,10 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// Reads from the local node over IPC, broadcasts over Tor. `{ ok, network, localNode }`.
     /// Backend only.
     fn set_local_node(&self, network: String, enabled: bool) -> String;
+    /// The network a wallet is open on, or "" for none: only its servers are checked, and only
+    /// it keeps the built-in Tor asked. Until a backend calls this, every network is.
+    /// `{ ok, watching }`. Backend only.
+    fn watch(&self, network: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -127,6 +131,10 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
 
     fn set_local_node(&self, network: String, enabled: bool) -> String {
         self.gated(Access::Backend, |n| n.set_local_node(&network, enabled))
+    }
+
+    fn watch(&self, network: String) -> String {
+        self.gated(Access::Backend, |n| n.watch(&network))
     }
 
     /// Loads the servers and starts the Tor and health threads; the threads make the calls.
