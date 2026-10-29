@@ -2478,11 +2478,16 @@ dependencies = [
 name = "zcash_node"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bytes",
  "futures-util",
  "hex",
  "http",
+ "http-body",
+ "http-body-util",
  "hyper-util",
  "logos-rust-sdk",
+ "prost",
  "rand 0.10.3",
  "serde",
  "serde_json",

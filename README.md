@@ -1,10 +1,12 @@
 # logos-zcash-node-module
 
 `zcash_node_module`: the lightwalletd servers a Zcash wallet talks to, per network. It keeps
-the server list and the socks5h proxy, answers a route table for each kind of call, and polls
-every enabled server's health over Tor. Servers on the user's own network are reached
-directly, and the user may set any https server to skip Tor. With no proxy only those servers
-have a route: everything else fails closed.
+the server list and the proxy, answers a route table for each kind of call, and polls every
+enabled server's health over Tor. The proxy is the Tor that comes with Logos
+([`tor_module`](https://github.com/logos-co/logos-tor-module)), reached over IPC, unless the
+user picks their own. Servers on the user's own network are reached directly, and the user may set any https
+server to skip Tor. With no proxy only those servers have a route: everything else fails
+closed.
 
 ## Presets
 
@@ -44,6 +46,26 @@ server:
 
 The proxy `direct` means none: only LAN servers and the ones set to `direct` are then
 reached.
+
+## The built-in Tor
+
+The proxy setting `tor`, the default, is `tor_module`, a dependency the host loads with this
+module, reached over Logos IPC: no SOCKS port is involved. Each gRPC call becomes one
+HTTP/2 request to tor_module, which does the TLS, and its answer comes back over IPC. Calls
+on one client share a circuit and an HTTP/2 connection, as they would one connection
+through a SOCKS proxy; another client gets its own.
+- The route table names it as the proxy `tor`, so the wallet core reaches it over IPC too.
+  A request starts Tor if it has not, so servers keep their routes while Tor joins.
+- While a network uses it, a thread asks it for its status every 2 s until Tor is ready,
+  then every 30 s, and `server_health` carries its `{ state, progress, detail }` as `tor`:
+  `connecting`, `ready`, `blocked` or `failed`. With every network on the user's own Tor,
+  or on none, nothing is asked and the built-in Tor never connects.
+- The poller looks again when Tor becomes ready, since checks made while it joined timed out.
+- The user's own Tor is set as `socks5h://host:port`, such as a system Tor at
+  `socks5h://127.0.0.1:9050` or Tor Browser at `socks5h://127.0.0.1:9150`.
+
+Settings saved before the built-in Tor (file version 1) seeded `socks5h://127.0.0.1:9050`.
+Those move to `tor` once, when the file loads; a proxy the user chose stays.
 
 ## Routes
 

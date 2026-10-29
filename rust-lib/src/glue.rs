@@ -7,7 +7,7 @@ use std::time::Duration;
 use logos_rust_sdk::{AboutToUnload, LogosCaller, Shutdown};
 
 use crate::gate::{Access, Caller, Callers};
-use crate::node::{Event, Node, Sink};
+use crate::node::{Event, Node, Sink, TorView};
 use crate::poll::Poller;
 use crate::reply;
 use crate::store::FILE_NAME;
@@ -21,14 +21,18 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     fn set_servers(&self, network: String, list_json: String) -> String;
     /// `two-operators`, `single` or `custom`; regtest has none. Backend only.
     fn apply_preset(&self, network: String, name: String) -> String;
-    /// `{ proxy, proxyRequired }`; the proxy must be socks5h://host:port, or `direct` on
-    /// regtest. Backend only.
+    /// `{ proxy, proxyRequired }`; the proxy is `tor` (the built-in Tor, the default), the
+    /// user's own as socks5h://host:port, or `direct` on regtest. Backend only.
     fn set_proxy(&self, network: String, config_json: String) -> String;
     /// `{ ok, network, proxy, proxyRequired, crossCheck, sync, details, taddr, broadcast,
-    /// mempool, tip }`, each class a list of `{ id, url, operator }`. Backend and wallet core.
+    /// mempool, tip }`, each class a list of `{ id, url, operator }`. `proxy` is what to dial
+    /// through: for `tor`, the built-in Tor's port, and an error until it is known. Backend
+    /// and wallet core.
     fn route_table(&self, network: String) -> String;
     /// `{ ok, network, overall, pending, servers: [{ id, reachable, rttMs, chain, branchId,
-    /// height, protocolVersion, lightwalletdVersion, vendor, suspect, lastError, checkedAt }] }`.
+    /// height, protocolVersion, lightwalletdVersion, vendor, suspect, lastError, checkedAt }],
+    /// tor }`; `tor` is the built-in Tor's `{ state, progress, detail }` when the network
+    /// uses it, else null.
     fn server_health(&self, network: String) -> String;
     /// Marks a server suspect until the backend clears it. Backend and wallet core.
     fn report_mismatch(&self, network: String, server_id: String, kind: String, height: i64) -> String;
@@ -61,6 +65,7 @@ pub struct ZcashNodeModuleImpl {
     // Qualified: the generated scaffold already imports `Mutex` into this module.
     callers: std::sync::Mutex<Callers>,
     poller: std::sync::Mutex<Option<Poller>>,
+    tor: std::sync::Mutex<Option<TorFollower>>,
 }
 
 impl ZcashNodeModuleImpl {
@@ -124,7 +129,7 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         self.gated(Access::Backend, |n| n.set_local_node(&network, enabled))
     }
 
-    /// Loads the servers and starts the health thread; the thread makes the calls.
+    /// Loads the servers and starts the Tor and health threads; the threads make the calls.
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();
@@ -143,10 +148,136 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         });
         let node = Node::open(Some(dir.join(FILE_NAME)), sink);
         node.set_local_status(Arc::new(ZebradStatus::default()));
+        crate::net::tor::set_tor(Arc::new(TorIpc::default()));
         if self.node.set(node.clone()).is_ok() {
+            match TorFollower::start(node.clone()) {
+                Ok(t) => *self.tor.lock().unwrap() = Some(t),
+                Err(e) => eprintln!("zcash_node_module: tor thread: {e}"),
+            }
             match Poller::start(node) {
                 Ok(p) => *self.poller.lock().unwrap() = Some(p),
                 Err(e) => eprintln!("zcash_node_module: health thread: {e}"),
+            }
+        }
+    }
+}
+
+/// Bounds each status call, so unloading never waits on tor_module for long.
+const TOR_BUDGET: Duration = Duration::from_millis(1000);
+
+/// Follows tor_module, the built-in Tor, while a network uses it: its status every 2 s until
+/// it is ready, then every 30 s. Asking starts Tor, so with no network on it nothing is asked
+/// and Tor stays off. The call is async with a channel: a blocking one from this thread would
+/// run nested on the main thread.
+struct TorFollower {
+    stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TorFollower {
+    fn start(node: Arc<Node>) -> std::io::Result<Self> {
+        let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new().name("zcash_node_tor".into()).spawn(move || {
+            // One client: each new one opens its own connection.
+            let client = tor_module::TorModuleClient::new();
+            loop {
+                let mut every = Duration::from_secs(2);
+                if node.uses_built_in_tor() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    client.status_async_with_timeout(TOR_BUDGET, move |r| {
+                        let _ = tx.send(r.map_err(|e| e.to_string()));
+                    });
+                    let reply = rx
+                        .recv_timeout(TOR_BUDGET + Duration::from_millis(200))
+                        .unwrap_or_else(|_| Err("tor_module did not answer".into()));
+                    let view = TorView::from_reply(reply);
+                    if view.state == "ready" {
+                        every = Duration::from_secs(30);
+                    }
+                    node.set_tor(view);
+                }
+                let (lock, cvar) = &*flag;
+                let (stopped, _) = cvar.wait_timeout_while(lock.lock().unwrap(), every, |s| !*s).unwrap();
+                if *stopped {
+                    return;
+                }
+            }
+        })?;
+        Ok(Self { stop, thread: Some(thread) })
+    }
+
+    fn signal(&self) {
+        let (lock, cvar) = &*self.stop;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    fn join(mut self) {
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The built-in Tor over IPC: tor_module's requests, asked after until each answer is in.
+/// The client is made on first use and kept: each new one opens its own connection.
+#[derive(Default)]
+struct TorIpc(OnceLock<tor_module::TorModuleClient>);
+
+/// One call to tor_module, which answers each at once.
+const TOR_CALL: Duration = Duration::from_secs(5);
+/// How often a request in flight is asked after.
+const TOR_POLL: Duration = Duration::from_millis(50);
+/// A gRPC call's whole budget at tor_module.
+const TOR_REQUEST_MS: u64 = 120_000;
+
+type Reply = std::sync::mpsc::SyncSender<Result<String, String>>;
+
+impl TorIpc {
+    /// Async, then waited for here: a blocking call waits in a nested event loop on the main
+    /// thread, and concurrent ones nest there and return only innermost first.
+    fn call(&self, send: impl FnOnce(&tor_module::TorModuleClient, Reply)) -> Result<serde_json::Value, String> {
+        let client = self.0.get_or_init(tor_module::TorModuleClient::new);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        send(client, tx);
+        let reply = rx.recv_timeout(TOR_CALL + Duration::from_millis(500)).map_err(|_| "tor_module did not answer".to_string())??;
+        serde_json::from_str(&reply).map_err(|e| format!("tor_module: {e}"))
+    }
+}
+
+fn answer(tx: Reply) -> impl FnOnce(Result<String, logos_rust_sdk::LogosError>) + Send + 'static {
+    move |r| {
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    }
+}
+
+impl crate::net::tor::TorRequests for TorIpc {
+    fn grpc(&self, url: &str, body: &[u8], key: &str) -> (i32, String, Vec<u8>) {
+        use crate::net::tor::{closed, grpc_answer, UNAVAILABLE};
+        let unavailable = |e: String| (UNAVAILABLE, e, Vec::new());
+        let refused = |v: &serde_json::Value| unavailable(format!("tor_module: {}", v["error"].as_str().unwrap_or("refused")));
+        let spec = serde_json::json!({
+            "method": "POST", "url": url, "http2": true, "isolation": key, "timeoutMs": TOR_REQUEST_MS,
+            "headers": [["content-type", "application/grpc"], ["te", "trailers"]],
+        })
+        .to_string();
+        let id = match self.call(|c, tx| c.request_async_with_timeout(&spec, body, TOR_CALL, answer(tx))) {
+            Ok(v) if v["ok"] == true => v["request"].as_str().unwrap_or_default().to_string(),
+            Ok(v) => return refused(&v),
+            Err(e) => return unavailable(e),
+        };
+        loop {
+            // Unloading: tor_module drops the request once its timeout passes.
+            if closed() {
+                return unavailable("the module is unloading".into());
+            }
+            std::thread::sleep(TOR_POLL);
+            match self.call(|c, tx| c.response_async_with_timeout(&id, TOR_CALL, answer(tx))) {
+                Ok(v) if v["ok"] == true && v["state"] == "pending" => continue,
+                Ok(v) if v["ok"] == true => return grpc_answer(&v),
+                Ok(v) => return refused(&v),
+                Err(e) => return unavailable(e),
             }
         }
     }
@@ -174,12 +305,22 @@ impl crate::node::LocalStatus for ZebradStatus {
 }
 
 impl AboutToUnload for ZcashNodeModuleImpl {
-    /// Stops the health thread, cancelling calls in flight, and joins it within ~1 s.
+    /// Ends the calls to tor_module in flight, then stops the Tor and health threads and joins
+    /// them, within ~1.5 s: the Tor thread's last call runs out while the health thread stops.
     fn about_to_unload(&self) -> Shutdown {
+        // Calls to tor_module in flight end first; none starts after.
+        crate::net::tor::close(Duration::from_millis(300));
+        let tor = self.tor.lock().unwrap().take();
+        if let Some(t) = &tor {
+            t.signal();
+        }
         if let Some(p) = self.poller.lock().unwrap().take() {
             if !p.stop(Duration::from_millis(1000)) {
                 eprintln!("zcash_node_module: health thread did not stop within 1 s");
             }
+        }
+        if let Some(t) = tor {
+            t.join();
         }
         Shutdown::Synchronous
     }
