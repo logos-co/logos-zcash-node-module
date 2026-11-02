@@ -1,5 +1,6 @@
-//! What persists, per network: the preset, the servers, the proxy and the suspects.
-//! Written atomically to `<instance_persistence_path>/zcash_servers.json`.
+//! What persists: per network, the preset, the servers, the proxy and the suspects; for
+//! every network, what Tor is used for. Written atomically to
+//! `<instance_persistence_path>/zcash_servers.json`.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -12,7 +13,7 @@ use crate::proxy::{self, DEFAULT_PROXY};
 use crate::servers::{self, preset_servers, Preset, Server, Source};
 
 pub const FILE_NAME: &str = "zcash_servers.json";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -149,11 +150,44 @@ impl NetConfig {
     }
 }
 
+/// What goes through Tor: everything, only the calls that name the wallet's transactions,
+/// addresses or sends, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TorUse {
+    All,
+    #[default]
+    Identifying,
+    None,
+}
+
+impl TorUse {
+    pub fn parse(s: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(s.into())).ok()
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Identifying => "identifying",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Store {
     pub version: u32,
     pub networks: BTreeMap<ZNetwork, NetConfig>,
+    #[serde(default)]
+    pub tor_use: TorUse,
+    /// The user picked `tor_use`; until then the app asks.
+    #[serde(default)]
+    pub tor_use_chosen: bool,
+    /// `tor_use` came from the routing of a file older than the setting.
+    #[serde(default)]
+    pub tor_use_migrated: bool,
 }
 
 pub enum Loaded {
@@ -164,7 +198,13 @@ pub enum Loaded {
 
 impl Store {
     pub fn seeded() -> Self {
-        Self { version: VERSION, networks: networks().into_iter().map(|n| (n, NetConfig::seeded(n))).collect() }
+        Self {
+            version: VERSION,
+            networks: networks().into_iter().map(|n| (n, NetConfig::seeded(n))).collect(),
+            tor_use: TorUse::default(),
+            tor_use_chosen: false,
+            tor_use_migrated: false,
+        }
     }
 
     /// Reads the file; a network missing from it gets its presets, and regtest is
@@ -210,6 +250,8 @@ impl Store {
     }
 
     /// Version 1 seeded a Tor the user had to run; the built-in one takes its place, once.
+    /// Before version 3 a proxy alone said what went through Tor: any Tor is `all`, none at
+    /// all is `none`, and the app still asks.
     pub fn upgrade(&mut self) -> bool {
         if self.version == VERSION {
             return false;
@@ -218,6 +260,12 @@ impl Store {
             if cfg.proxy.as_deref() == Some(proxy::OLD_DEFAULT_PROXY) {
                 cfg.proxy = Some(proxy::BUILT_IN.into());
             }
+        }
+        if self.version < 3 {
+            let public = self.networks.iter().filter(|(n, _)| **n != ZNetwork::Regtest);
+            let tor = public.clone().any(|(_, c)| c.proxy.as_deref().is_some_and(proxy::is_tor));
+            self.tor_use = if tor || public.count() == 0 { TorUse::All } else { TorUse::None };
+            (self.tor_use_chosen, self.tor_use_migrated) = (false, true);
         }
         self.version = VERSION;
         true
@@ -310,7 +358,7 @@ mod tests {
     fn missing_network_is_seeded_and_bad_files_are_set_aside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        let only_main = Store { version: VERSION, networks: [(ZNetwork::Mainnet, NetConfig::seeded(ZNetwork::Mainnet))].into() };
+        let only_main = Store { networks: [(ZNetwork::Mainnet, NetConfig::seeded(ZNetwork::Mainnet))].into(), ..Store::seeded() };
         only_main.save(&path).unwrap();
         match Store::load(&path) {
             Loaded::Found(s) => assert_eq!(s, Store::seeded()),
@@ -422,6 +470,44 @@ mod tests {
         assert!(only.retire_presets(ZNetwork::Testnet));
         assert_eq!(only.servers, preset_servers(ZNetwork::Testnet, Preset::TwoOperators).unwrap());
         assert!(!only.retire_presets(ZNetwork::Testnet));
+    }
+
+    #[test]
+    fn older_files_keep_their_routing_until_the_user_chooses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        assert_eq!((Store::seeded().tor_use, Store::seeded().tor_use_chosen), (TorUse::Identifying, false));
+        let old = |version, main: Option<&str>, test: Option<&str>| {
+            let mut s = Store::seeded();
+            s.version = version;
+            s.networks.get_mut(&ZNetwork::Mainnet).unwrap().proxy = main.map(String::from);
+            s.networks.get_mut(&ZNetwork::Testnet).unwrap().proxy = test.map(String::from);
+            // What a version 2 file holds: no torUse fields.
+            let mut v = serde_json::to_value(&s).unwrap();
+            for k in ["torUse", "torUseChosen", "torUseMigrated"] {
+                v.as_object_mut().unwrap().remove(k);
+            }
+            std::fs::write(&path, v.to_string()).unwrap();
+            Store::load_or_seed(&path)
+        };
+        let mode = |s: &Store| (s.tor_use, s.tor_use_chosen, s.tor_use_migrated);
+        // Any Tor, built-in, the user's own or version 1's default, is `all`; never weakened.
+        assert_eq!(mode(&old(2, Some(proxy::BUILT_IN), Some(proxy::BUILT_IN))), (TorUse::All, false, true));
+        assert_eq!(mode(&old(2, Some("socks5h://127.0.0.1:9150"), Some(proxy::DIRECT))), (TorUse::All, false, true));
+        assert_eq!(mode(&old(1, Some(proxy::OLD_DEFAULT_PROXY), None)), (TorUse::All, false, true));
+        // No Tor anywhere is `none`, and the proxies stay as they were.
+        let none = old(2, Some(proxy::DIRECT), None);
+        assert_eq!(mode(&none), (TorUse::None, false, true));
+        assert_eq!(none.networks[&ZNetwork::Mainnet].proxy.as_deref(), Some(proxy::DIRECT));
+        assert_eq!(none.version, VERSION);
+        // Upgraded once: a later choice survives loading.
+        let mut chosen = none.clone();
+        (chosen.tor_use, chosen.tor_use_chosen) = (TorUse::Identifying, true);
+        chosen.save(&path).unwrap();
+        assert_eq!(Store::load_or_seed(&path), chosen);
+        // A version this build does not know is set aside, as before.
+        std::fs::write(&path, r#"{"version":4,"networks":{}}"#).unwrap();
+        assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains("unknown version 4")));
     }
 
     #[test]

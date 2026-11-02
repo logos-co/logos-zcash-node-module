@@ -25,14 +25,14 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// user's own as socks5h://host:port, or `direct` on regtest. Backend only.
     fn set_proxy(&self, network: String, config_json: String) -> String;
     /// `{ ok, network, proxy, proxyRequired, crossCheck, sync, details, taddr, broadcast,
-    /// mempool, tip }`, each class a list of `{ id, url, operator }`. `proxy` is what to dial
-    /// through: for `tor`, the built-in Tor's port, and an error until it is known. Backend
-    /// and wallet core.
+    /// mempool, tip, direct, torUse, directFor }`, each class a list of `{ id, url, operator }`.
+    /// `proxy` is what to dial through; `direct` the servers and `directFor` the classes that
+    /// go without it. Backend and wallet core.
     fn route_table(&self, network: String) -> String;
     /// `{ ok, network, overall, pending, servers: [{ id, reachable, rttMs, chain, branchId,
     /// height, protocolVersion, lightwalletdVersion, vendor, suspect, lastError, checkedAt }],
-    /// tor }`; `tor` is the built-in Tor's `{ state, progress, detail }` when the network
-    /// uses it, else null.
+    /// tor, torUse, torUseChosen, torUseMigrated }`; `tor` is the built-in Tor's `{ state,
+    /// progress, detail }` when the network uses it, else null.
     fn server_health(&self, network: String) -> String;
     /// Marks a server suspect until the backend clears it. Backend and wallet core.
     fn report_mismatch(&self, network: String, server_id: String, kind: String, height: i64) -> String;
@@ -48,6 +48,12 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// it keeps the built-in Tor asked. Until a backend calls this, every network is.
     /// `{ ok, watching }`. Backend only.
     fn watch(&self, network: String) -> String;
+    /// `{ ok, torUse, torUseChosen, torUseMigrated }`: what goes through Tor, on every network.
+    fn tor_use(&self) -> String;
+    /// `all`, `identifying` or `none`; refused while a wallet is open. Backend only.
+    fn set_tor_use(&self, mode: String) -> String;
+    /// Whether a wallet is open on `network`, which locks torUse. Backend only.
+    fn set_wallet_open(&self, network: String, open: bool) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -135,6 +141,18 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
 
     fn watch(&self, network: String) -> String {
         self.gated(Access::Backend, |n| n.watch(&network))
+    }
+
+    fn tor_use(&self) -> String {
+        self.gated(Access::Open, |n| n.tor_use())
+    }
+
+    fn set_tor_use(&self, mode: String) -> String {
+        self.gated(Access::Backend, |n| n.set_tor_use(&mode))
+    }
+
+    fn set_wallet_open(&self, network: String, open: bool) -> String {
+        self.gated(Access::Backend, |n| n.set_wallet_open(&network, open))
     }
 
     /// Loads the servers and starts the Tor and health threads; the threads make the calls.
