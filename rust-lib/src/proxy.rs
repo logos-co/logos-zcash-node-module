@@ -75,6 +75,11 @@ pub fn normalize(url: &str) -> Result<String, String> {
     Ok(format!("socks5h://{host}:{}", addr.port))
 }
 
+/// The built-in Tor or the user's own, rather than none.
+pub fn is_tor(proxy: &str) -> bool {
+    proxy != DIRECT
+}
+
 /// What a stored proxy dials through: nothing for `direct`, a socks5h proxy otherwise.
 pub fn addr(proxy: &str) -> Result<ProxyAddr, String> {
     match proxy {

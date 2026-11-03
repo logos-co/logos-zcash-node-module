@@ -1,8 +1,8 @@
 # logos-zcash-node-module
 
 `zcash_node_module`: the lightwalletd servers a Zcash wallet talks to, per network. It keeps
-the server list and the proxy, answers a route table for each kind of call, and checks the
-enabled servers of the network a wallet is open on every 60 s, over Tor. The backend says which
+the server list, the proxy and what Tor is used for, answers a route table for each kind of
+call, and checks the enabled servers of the network a wallet is open on every 60 s. The backend says which
 network with `watch(network)`, and `watch("")` when the wallet closes; until it does, every
 network's servers are checked. The proxy is the Tor that comes with Logos
 ([`tor_module`](https://github.com/logos-co/logos-tor-module)), reached over IPC, unless the
@@ -26,6 +26,32 @@ A preset host a later release drops leaves saved lists when they load; the user'
 servers stay. A host it adds is offered once: a list still on its preset follows it, keeping
 the user's Tor choices, and a `custom` list gets the host switched off.
 
+## Use Tor for
+
+One setting for every network, `set_tor_use(mode)`:
+
+| Mode | Direct | Through Tor |
+|---|---|---|
+| `all` | Servers on the user's network, and https servers set to skip Tor | Everything else |
+| `identifying` (default) | `sync` and `tip`: compact blocks, tree states, subtree roots, tips | `details`, `taddr`, `broadcast`, `mempool`: anything that names the wallet's transactions, addresses or sends, and the health checks |
+| `none` | Every https server | Nothing: onion services are off, and tor_module is never asked |
+
+- The route table carries `torUse` and `directFor`, the classes the wallet core dials directly
+  (`["sync","tip"]` in `identifying`). An older core ignores `directFor` and keeps every call on
+  Tor. In `none`, `direct` lists every enabled https server and the proxy is `direct`.
+- An onion service goes through Tor in every mode, and a server on the user's network is
+  direct in every mode. The per-server Tor switch applies to `all` only.
+- `identifying` and `all` need a Tor: setting either gives each network without one the
+  built-in Tor. Which Tor stays per network (`set_proxy`).
+- `tor_use()` and `server_health` answer `{ torUse, torUseChosen, torUseMigrated }`.
+  `torUseChosen` turns true at the first `set_tor_use`; until then the app asks.
+- Refused while a wallet is open: the backend reports it with `set_wallet_open(network, open)`.
+
+A fresh file starts at `identifying`. A file from before the setting (version 1 or 2) keeps its
+routing: `all` if any network has a Tor proxy, else `none`, with `torUseMigrated` true and
+`torUseChosen` false, so the app asks once with today's routing preselected. An older build
+sets a version 3 file aside as corrupt and seeds the presets.
+
 ## Servers and Tor
 
 A server is one of:
@@ -39,15 +65,15 @@ A server is one of:
 `set_servers` also takes a bare `host` or `host:port`: onion and LAN hosts become http, the
 rest https.
 
-LAN servers are always dialled directly, since Tor cannot reach them. Tor is chosen per
-server:
+LAN servers are always dialled directly, since Tor cannot reach them. With `all`, Tor is
+chosen per server:
 - a server with `"direct": true` is reached without Tor;
 - `direct` is refused for an onion service, which is reached through Tor only;
 - the choice survives re-applying a preset;
 - the route table lists these servers in `direct`, for the wallet core.
 
-The proxy `direct` means none: only LAN servers and the ones set to `direct` are then
-reached.
+The proxy `direct` means none: with `all`, only LAN servers and the ones set to `direct` are
+then reached, and with `identifying` only LAN servers.
 
 ## The built-in Tor
 
@@ -61,7 +87,8 @@ through a SOCKS proxy; another client gets its own.
 - While the watched network uses it, a thread asks it for its status every 2 s until Tor is
   ready, then every 30 s, and `server_health` carries its `{ state, progress, detail }` as `tor`:
   `connecting`, `ready`, `blocked` or `failed`. With every network on the user's own Tor,
-  or on none, or with no wallet open, nothing is asked and the built-in Tor never connects.
+  or on none, with Tor used for nothing, or with no wallet open, nothing is asked and the
+  built-in Tor never connects.
 - The poller looks again when Tor becomes ready, since checks made while it joined timed out.
 - The user's own Tor is set as `socks5h://host:port`, such as a system Tor at
   `socks5h://127.0.0.1:9050` or Tor Browser at `socks5h://127.0.0.1:9150`.
@@ -72,8 +99,8 @@ Those move to `tor` once, when the file loads; a proxy the user chose stays.
 ## Routes
 
 `route_table(network)` gives the wallet core one list per call class: `sync`, `details`,
-`taddr`, `broadcast`, `mempool` and `tip`, plus the proxy and `crossCheck`, true when a second
-operator is enabled. Each route is `{ id, url, operator }`.
+`taddr`, `broadcast`, `mempool` and `tip`, plus the proxy, `direct`, `torUse`, `directFor` and
+`crossCheck`, true when a second operator is enabled. Each route is `{ id, url, operator }`.
 
 ## Regtest (test harnesses)
 
@@ -85,8 +112,8 @@ Regtest has no presets and starts with no servers and no proxy. Its lightwalletd
 
 ## Callers
 
-Only `zcash_wallet_backend` may change the list, the preset or the proxy, clear a suspect
-server, or say which network a wallet is open on. The backend and `zcash_wallet_core_module`
+Only `zcash_wallet_backend` may change the list, the preset, the proxy or what Tor is used
+for, clear a suspect server, or say which network a wallet is open on or watched. The backend and `zcash_wallet_core_module`
 may read routes and report a mismatch, which marks a server suspect until the backend clears
 it. Events: `server_health_changed`, `routes_changed`, `server_suspect`.
 
