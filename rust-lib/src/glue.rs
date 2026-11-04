@@ -13,7 +13,8 @@ use crate::reply;
 use crate::store::FILE_NAME;
 
 pub trait ZcashNodeModule: Send + Sync + 'static {
-    /// `{ ok, network, preset, servers: [{ id, url, operator, label, enabled, classes, source }] }`.
+    /// `{ ok, network, preset, servers: [{ id, url, operator, label, enabled, classes, source,
+    /// direct }], proxy, proxyRequired, localNode, chainSource, own, localSends }`.
     fn servers(&self, network: String) -> String;
     /// Replaces the list with a JSON array of servers (https only, unique ids, one
     /// enabled at least); the preset becomes `custom`. Regtest also takes
@@ -41,9 +42,18 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// `{ ok, enabled, available, status?, error? }`: whether reads go to the local node, and
     /// whether zebrad_module runs it for `network`; `status` is its status().
     fn local_node(&self, network: String) -> String;
-    /// Reads from the local node over IPC, broadcasts over Tor. `{ ok, network, localNode }`.
-    /// Backend only.
+    /// Reads from the local node over IPC, sends as set_local_sends says. `{ ok, network,
+    /// localNode }`. Backend only.
     fn set_local_node(&self, network: String, enabled: bool) -> String;
+    /// `public`, `local` or `own`: the server list, the local node, or the user's own server.
+    /// Only public servers follow Use Tor for. `{ ok, network, chainSource }`. Backend only.
+    fn set_chain_source(&self, network: String, source: String) -> String;
+    /// `{ url, tor, label? }`: the user's own lightwalletd, which then takes every call; an
+    /// empty url forgets it. `{ ok, network, own, chainSource }`. Backend only.
+    fn set_own_server(&self, network: String, config_json: String) -> String;
+    /// With the local node, `servers` (through them, always over Tor) or `node` (no server is
+    /// contacted). `{ ok, network, localSends }`. Backend only.
+    fn set_local_sends(&self, network: String, via: String) -> String;
     /// The network a wallet is open on, or "" for none: only its servers are checked, and only
     /// it keeps the built-in Tor asked. Until a backend calls this, every network is.
     /// `{ ok, watching }`. Backend only.
@@ -137,6 +147,18 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
 
     fn set_local_node(&self, network: String, enabled: bool) -> String {
         self.gated(Access::Backend, |n| n.set_local_node(&network, enabled))
+    }
+
+    fn set_chain_source(&self, network: String, source: String) -> String {
+        self.gated(Access::Backend, |n| n.set_chain_source(&network, &source))
+    }
+
+    fn set_own_server(&self, network: String, config_json: String) -> String {
+        self.gated(Access::Backend, |n| n.set_own_server(&network, &config_json))
+    }
+
+    fn set_local_sends(&self, network: String, via: String) -> String {
+        self.gated(Access::Backend, |n| n.set_local_sends(&network, &via))
     }
 
     fn watch(&self, network: String) -> String {
