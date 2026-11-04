@@ -190,6 +190,9 @@ pub fn parse_list(net: ZNetwork, json: &str) -> Result<Vec<Server>, String> {
             return Err("server list: every entry must be a JSON object".into());
         }
         let s: ServerInput = serde_json::from_value(item).map_err(|e| format!("server list: {e}"))?;
+        if s.id == crate::store::OWN_ID {
+            return Err(format!("server list: {} is the id of your own server", s.id));
+        }
         let url = normalize_url(&s.url)?;
         let operator = s.operator.trim().to_string();
         let mut classes = s.classes.unwrap_or_else(|| ALL_CLASSES.to_vec());
@@ -204,6 +207,43 @@ pub fn parse_list(net: ZNetwork, json: &str) -> Result<Vec<Server>, String> {
     }
     validate(net, &out)?;
     Ok(out)
+}
+
+/// set_own_server's argument.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnInput {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default = "enabled_by_default")]
+    tor: bool,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// The user's own server from `{ url, tor, label? }`, or `None` for no url. `tor` decides only
+/// for an https server: one on the user's network is always direct, an onion service never.
+pub fn parse_own(net: ZNetwork, json: &str) -> Result<Option<Server>, String> {
+    let input: OwnInput = serde_json::from_str(json).map_err(|e| format!("own server: {e}"))?;
+    let Some(raw) = input.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else { return Ok(None) };
+    let url = normalize_url(raw)?;
+    let label = match input.label.map(|l| l.trim().to_string()) {
+        Some(l) if !l.is_empty() => l,
+        _ => host_of(&url),
+    };
+    let direct = !input.tor && url.starts_with("https://") && !crate::net::client::is_lan_url(&url);
+    let own = Server {
+        id: crate::store::OWN_ID.into(),
+        url,
+        operator: crate::store::OWN_ID.into(),
+        label,
+        enabled: true,
+        classes: ALL_CLASSES.to_vec(),
+        source: Source::User,
+        direct,
+    };
+    validate(net, std::slice::from_ref(&own))?;
+    Ok(Some(own))
 }
 
 /// The rules every stored list obeys, whoever wrote it. Regtest has no presets, so its

@@ -39,7 +39,58 @@ pub struct NetConfig {
     /// The preset hosts this list has been offered, so each new one is offered once.
     #[serde(default)]
     pub presets_seen: Vec<String>,
+    /// A lightwalletd the user runs elsewhere, kept while unused. Its `direct` is its Tor switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<Server>,
+    /// Every call goes to `own` instead of the list. Never with `local_node`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub own_on: bool,
+    /// With the local node, where transactions go out.
+    #[serde(default, skip_serializing_if = "LocalSends::is_default")]
+    pub local_sends: LocalSends,
 }
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Where the wallet gets the chain: the server list, the local node, or the user's own server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChainSource {
+    Public,
+    Local,
+    Own,
+}
+
+impl ChainSource {
+    pub fn parse(s: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(s.into())).ok()
+    }
+}
+
+/// With the local node: through the servers, always over Tor, or through the node itself,
+/// when no server is contacted at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalSends {
+    #[default]
+    Servers,
+    Node,
+}
+
+impl LocalSends {
+    pub fn parse(s: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(s.into())).ok()
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The user's own server's id; a list entry may not take it.
+pub const OWN_ID: &str = "own";
 
 fn preset_ids(net: ZNetwork) -> Vec<String> {
     preset_servers(net, Preset::TwoOperators).unwrap_or_default().into_iter().map(|s| s.id).collect()
@@ -49,7 +100,7 @@ impl NetConfig {
     pub fn seeded(net: ZNetwork) -> Self {
         // Regtest has no presets and no default proxy: the test harness sets both.
         if net == ZNetwork::Regtest {
-            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new(), local_node: false, presets_seen: vec![] };
+            return Self { preset: Preset::Custom, servers: vec![], proxy: None, proxy_required: false, suspects: BTreeMap::new(), local_node: false, presets_seen: vec![], own: None, own_on: false, local_sends: LocalSends::Servers };
         }
         Self {
             preset: Preset::TwoOperators,
@@ -59,11 +110,33 @@ impl NetConfig {
             suspects: BTreeMap::new(),
             local_node: false,
             presets_seen: preset_ids(net),
+            own: None,
+            own_on: false,
+            local_sends: LocalSends::Servers,
         }
     }
 
+    /// A list entry, or the user's own server by its id.
     pub fn server(&self, id: &str) -> Option<&Server> {
-        self.servers.iter().find(|s| s.id == id)
+        self.servers.iter().chain(&self.own).find(|s| s.id == id)
+    }
+
+    pub fn chain_source(&self) -> ChainSource {
+        match (self.local_node, self.own_on && self.own.is_some()) {
+            (true, _) => ChainSource::Local,
+            (false, true) => ChainSource::Own,
+            _ => ChainSource::Public,
+        }
+    }
+
+    /// The servers the wallet uses: its own server alone, none with the local node sending
+    /// itself, else the list.
+    pub fn in_use(&self) -> &[Server] {
+        match (self.chain_source(), &self.own) {
+            (ChainSource::Own, Some(own)) => std::slice::from_ref(own),
+            (ChainSource::Local, _) if self.local_sends == LocalSends::Node => &[],
+            _ => &self.servers,
+        }
     }
 
     /// Replaces the list, keeping only the suspicions of servers still at the same url.
@@ -71,7 +144,7 @@ impl NetConfig {
         let old = std::mem::replace(&mut self.servers, servers);
         let same = |id: &str| {
             let was = old.iter().find(|s| s.id == id).map(|s| &s.url);
-            was.is_some() && was == self.servers.iter().find(|s| s.id == id).map(|s| &s.url)
+            id == OWN_ID || was.is_some() && was == self.servers.iter().find(|s| s.id == id).map(|s| &s.url)
         };
         self.suspects.retain(|id, _| same(id));
     }
@@ -138,6 +211,12 @@ impl NetConfig {
 
     pub fn validate(&self, net: ZNetwork) -> Result<(), String> {
         servers::validate(net, &self.servers)?;
+        if let Some(own) = &self.own {
+            servers::validate(net, std::slice::from_ref(own))?;
+            if own.id != OWN_ID || self.servers.iter().any(|s| s.id == OWN_ID) {
+                return Err(format!("only the user's own server is {OWN_ID}"));
+            }
+        }
         if let Some(p) = &self.proxy {
             if proxy::normalize(p)? != *p {
                 return Err(format!("proxy {p} is not normalized"));
@@ -352,6 +431,30 @@ mod tests {
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"mainnet\"") && text.contains("\"two-operators\"") && text.contains("\"proxyRequired\""));
+    }
+
+    #[test]
+    fn the_chain_source_is_written_only_once_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // Left at their defaults, the new fields stay out, so an older build still reads the file.
+        let mut store = Store::seeded();
+        store.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"own\"") && !text.contains("ownOn") && !text.contains("localSends"));
+        let test = store.networks.get_mut(&ZNetwork::Testnet).unwrap();
+        test.own = servers::parse_own(ZNetwork::Testnet, r#"{"url":"192.168.1.20"}"#).unwrap();
+        (test.own_on, test.local_sends) = (true, LocalSends::Node);
+        assert_eq!((test.chain_source(), test.in_use().len()), (ChainSource::Own, 1));
+        store.save(&path).unwrap();
+        match Store::load(&path) {
+            Loaded::Found(back) => assert_eq!(back, store),
+            _ => panic!("reload failed"),
+        }
+        // The local node wins over a stale own switch, and sending through it uses no server.
+        let test = store.networks.get_mut(&ZNetwork::Testnet).unwrap();
+        test.local_node = true;
+        assert_eq!((test.chain_source(), test.in_use().len()), (ChainSource::Local, 0));
     }
 
     #[test]

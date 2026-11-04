@@ -52,6 +52,31 @@ routing: `all` if any network has a Tor proxy, else `none`, with `torUseMigrated
 `torUseChosen` false, so the app asks once with today's routing preselected. An older build
 sets a version 3 file aside as corrupt and seeds the presets.
 
+## Where the chain comes from
+
+Per network, `set_chain_source(network, source)`:
+
+| Source | Reads | Sends | Through Tor |
+|---|---|---|---|
+| `public` (default) | the server list | the server list | as Use Tor for says |
+| `local` | the local node (`zebrad_module`), over Logos IPC | the servers, or the node | the servers always; the node never |
+| `own` | the user's own server, `set_own_server` | the same server | as its own switch says |
+
+- `local` is also `set_local_node(network, true)`. `set_local_sends(network, via)` says where
+  transactions go: `servers` (the default) or `node`. With `servers`, every request to them goes
+  through the proxy whatever Use Tor for says: sends, the check that another server has the
+  transaction, the cross-check of the node's chain every 120 s, and the health checks. The route
+  table has no `direct` and no `directFor`. A server on the user's network is still reached directly.
+- With `node`, no server is contacted at all: every class routes to the node, nothing is polled,
+  and the built-in Tor is not started for that network.
+- `set_own_server(network, { url, tor, label? })` saves the user's own lightwalletd and switches
+  to it; an empty url forgets it. Every call goes to it alone: no cross-check, and only it is
+  polled. On the user's network it is reached directly, an onion service through Tor, and any other
+  host through Tor unless `tor` is false. Use Tor for does not apply.
+- The list is kept as it is while another source is in use, and `public` brings it back.
+- `servers()` reports `chainSource`, `own` and `localSends`. The file holds `own`, `ownOn` and
+  `localSends` only once they differ from the defaults, so an older build still reads it.
+
 ## Servers and Tor
 
 A server is one of:
@@ -84,11 +109,12 @@ on one client share a circuit and an HTTP/2 connection, as they would one connec
 through a SOCKS proxy; another client gets its own.
 - The route table names it as the proxy `tor`, so the wallet core reaches it over IPC too.
   A request starts Tor if it has not, so servers keep their routes while Tor joins.
-- While the watched network uses it, a thread asks it for its status every 2 s until Tor is
-  ready, then every 30 s, and `server_health` carries its `{ state, progress, detail }` as `tor`:
-  `connecting`, `ready`, `blocked` or `failed`. With every network on the user's own Tor,
-  or on none, with Tor used for nothing, or with no wallet open, nothing is asked and the
-  built-in Tor never connects.
+- While a server the watched network uses goes through it, a thread asks it for its status
+  every 2 s until Tor is ready, then every 30 s, and `server_health` carries its `{ state,
+  progress, detail }` as `tor`: `connecting`, `ready`, `blocked` or `failed`. With no such server
+  (every network on the user's own Tor or none, public servers with Tor used for nothing, the
+  local node sending itself, an own server reached directly) or with no wallet open, nothing is
+  asked and the built-in Tor never connects.
 - The poller looks again when Tor becomes ready, since checks made while it joined timed out.
 - The user's own Tor is set as `socks5h://host:port`, such as a system Tor at
   `socks5h://127.0.0.1:9050` or Tor Browser at `socks5h://127.0.0.1:9150`.
