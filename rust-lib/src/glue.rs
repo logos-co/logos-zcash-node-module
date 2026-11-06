@@ -14,7 +14,8 @@ use crate::store::FILE_NAME;
 
 pub trait ZcashNodeModule: Send + Sync + 'static {
     /// `{ ok, network, preset, servers: [{ id, url, operator, label, enabled, classes, source,
-    /// direct }], proxy, proxyRequired, localNode, chainSource, own, localSends }`.
+    /// direct }], proxy, proxyRequired, localNode, chainSource, own, localSends,
+    /// localSendsFor }`. localSendsFor: the sources localSends applies to; absent, `local` only.
     fn servers(&self, network: String) -> String;
     /// Replaces the list with a JSON array of servers (https only, unique ids, one
     /// enabled at least); the preset becomes `custom`. Regtest also takes
@@ -48,11 +49,11 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// `public`, `local` or `own`: the server list, the local node, or the user's own server.
     /// Only public servers follow Use Tor for. `{ ok, network, chainSource }`. Backend only.
     fn set_chain_source(&self, network: String, source: String) -> String;
-    /// `{ url, tor, label? }`: the user's own lightwalletd, which then takes every call; an
-    /// empty url forgets it. `{ ok, network, own, chainSource }`. Backend only.
+    /// `{ url, tor, label? }`: the user's own lightwalletd, which then takes every read, and the
+    /// sends as set_local_sends says; an empty url forgets it. `{ ok, network, own, chainSource }`. Backend only.
     fn set_own_server(&self, network: String, config_json: String) -> String;
-    /// With the local node, `servers` (through them, always over Tor) or `node` (no server is
-    /// contacted). `{ ok, network, localSends }`. Backend only.
+    /// With the local node or the user's own server, `servers` (through them, always over Tor) or
+    /// `node` (through the node or that server; no public server is contacted). `{ ok, network, localSends }`. Backend only.
     fn set_local_sends(&self, network: String, via: String) -> String;
     /// The network a wallet is open on, or "" for none: only its servers are checked, and only
     /// it keeps the built-in Tor asked. Until a backend calls this, every network is.

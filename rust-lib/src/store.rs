@@ -45,7 +45,7 @@ pub struct NetConfig {
     /// Every call goes to `own` instead of the list. Never with `local_node`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub own_on: bool,
-    /// With the local node, where transactions go out.
+    /// With the local node or the user's own server, where transactions go out.
     #[serde(default, skip_serializing_if = "LocalSends::is_default")]
     pub local_sends: LocalSends,
     /// What goes through Tor to this network's public servers.
@@ -78,8 +78,8 @@ impl ChainSource {
     }
 }
 
-/// With the local node: through the servers, always over Tor, or through the node itself,
-/// when no server is contacted at all.
+/// With the local node or the user's own server: through the servers, always over Tor, or
+/// through the node or that server alone, when no public server is contacted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LocalSends {
@@ -142,13 +142,25 @@ impl NetConfig {
         }
     }
 
-    /// The servers the wallet uses: its own server alone, none with the local node sending
-    /// itself, else the list.
-    pub fn in_use(&self) -> &[Server] {
+    /// The servers the wallet uses: its own server, then the list when sends go through it;
+    /// with the local node, the list only then; else the list.
+    pub fn in_use(&self) -> Vec<&Server> {
+        let list = self.servers.iter();
         match (self.chain_source(), &self.own) {
-            (ChainSource::Own, Some(own)) => std::slice::from_ref(own),
-            (ChainSource::Local, _) if self.local_sends == LocalSends::Node => &[],
-            _ => &self.servers,
+            (ChainSource::Own, Some(own)) if self.local_sends == LocalSends::Node => vec![own],
+            (ChainSource::Own, Some(own)) => std::iter::once(own).chain(list).collect(),
+            (ChainSource::Local, _) if self.local_sends == LocalSends::Node => vec![],
+            _ => list.collect(),
+        }
+    }
+
+    /// With the local node or the user's own server sending through the servers, the enabled
+    /// ones that send. None otherwise, or with none enabled: the node or that server sends.
+    pub fn senders(&self) -> Vec<&Server> {
+        match self.chain_source() {
+            ChainSource::Public => vec![],
+            _ if self.local_sends == LocalSends::Node => vec![],
+            _ => self.servers.iter().filter(|s| s.enabled && s.classes.contains(&servers::CallClass::Broadcast)).collect(),
         }
     }
 
@@ -465,7 +477,10 @@ mod tests {
         assert!(!text.contains("\"own\"") && !text.contains("ownOn") && !text.contains("localSends"));
         let test = store.networks.get_mut(&ZNetwork::Testnet).unwrap();
         test.own = servers::parse_own(ZNetwork::Testnet, r#"{"url":"192.168.1.20"}"#).unwrap();
-        (test.own_on, test.local_sends) = (true, LocalSends::Node);
+        test.own_on = true;
+        // Sends through the servers by default, so they are in use too.
+        assert_eq!((test.in_use().len(), test.senders().len()), (1 + test.servers.len(), 2));
+        test.local_sends = LocalSends::Node;
         assert_eq!((test.chain_source(), test.in_use().len()), (ChainSource::Own, 1));
         store.save(&path).unwrap();
         match Store::load(&path) {
