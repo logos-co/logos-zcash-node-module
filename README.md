@@ -62,22 +62,27 @@ Per network, `set_chain_source(network, source)`:
 |---|---|---|---|
 | `public` (default) | the server list | the server list | as Use Tor for says |
 | `local` | the local node (`zebrad_module`), over Logos IPC | the servers, or the node | the servers always; the node never |
-| `own` | the user's own server, `set_own_server` | the same server | as its own switch says |
+| `own` | the user's own server, `set_own_server` | the servers, or the same server | the servers always; the user's server as its own switch says |
 
 - `local` is also `set_local_node(network, true)`. `set_local_sends(network, via)` says where
-  transactions go: `servers` (the default) or `node`. With `servers`, every request to them goes
-  through the proxy whatever Use Tor for says: sends, the check that another server has the
-  transaction, the cross-check of the node's chain every 120 s, and the health checks. The route
-  table has no `direct` and no `directFor`. A server on the user's network is still reached directly.
-- With `node`, no server is contacted at all: every class routes to the node, nothing is polled,
-  and the built-in Tor is not started for that network.
+  transactions go, for `local` and `own` alike: `servers` (the default) or `node`. With `servers`,
+  every request to them goes through the proxy whatever Use Tor for says or their own switches:
+  sends, the check that another server has the transaction, the cross-check of the local node's
+  chain every 120 s, and the health checks. A server on the user's network is still reached
+  directly. With no server that sends enabled, the node or the user's server sends.
+- With `node`, no public server is contacted: every class routes to the node or to the user's
+  server. The local node is not polled and starts no Tor; the user's server is polled, through the
+  built-in Tor only when it goes through Tor.
 - `set_own_server(network, { url, tor, label? })` saves the user's own lightwalletd and switches
-  to it; an empty url forgets it. Every call goes to it alone: no cross-check, and only it is
-  polled. On the user's network it is reached directly, an onion service through Tor, and any other
-  host through Tor unless `tor` is false. Use Tor for does not apply.
+  to it; an empty url forgets it. Every read goes to it alone, with no cross-check. On the user's
+  network it is reached directly, an onion service through Tor, and any other host through Tor
+  unless `tor` is false; the route table then lists it in `direct`. Use Tor for does not apply.
+- For both sources `directFor` is empty, and with `local` so is `direct`.
 - The list is kept as it is while another source is in use, and `public` brings it back.
-- `servers()` reports `chainSource`, `own` and `localSends`. The file holds `own`, `ownOn` and
-  `localSends` only once they differ from the defaults, so an older build still reads it.
+- `servers()` reports `chainSource`, `own`, `localSends` and `localSendsFor`, the sources
+  `localSends` applies to (`["local","own"]`); a module without that field applies it to `local`
+  only. The file holds `own`, `ownOn` and `localSends` only once they differ from the defaults, so
+  an older build still reads it.
 
 ## Servers and Tor
 
@@ -115,7 +120,7 @@ through a SOCKS proxy; another client gets its own.
   every 2 s until Tor is ready, then every 30 s, and `server_health` carries its `{ state,
   progress, detail }` as `tor`: `connecting`, `ready`, `blocked` or `failed`. With no such server
   (every network on the user's own Tor or none, public servers with Tor used for nothing, the
-  local node sending itself, an own server reached directly) or with no wallet open, nothing is
+  local node or an own server reached directly sending itself) or with no wallet open, nothing is
   asked and the built-in Tor never connects.
 - The poller looks again when Tor becomes ready, since checks made while it joined timed out.
 - The user's own Tor is set as `socks5h://host:port`, such as a system Tor at
