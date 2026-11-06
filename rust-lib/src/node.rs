@@ -216,14 +216,10 @@ impl Inner {
         cfg.proxy.clone()
     }
 
-    fn mode(&self) -> TorUse {
-        self.store.tor_use
-    }
-
     /// Use Tor for applies to public servers only.
     fn reach(&self, cfg: &NetConfig) -> Reach {
         match cfg.chain_source() {
-            ChainSource::Public => Reach { mode: self.mode(), per_server: true },
+            ChainSource::Public => Reach { mode: cfg.tor_use, per_server: true },
             ChainSource::Local => Reach { mode: TorUse::All, per_server: false },
             ChainSource::Own => Reach { mode: TorUse::All, per_server: true },
         }
@@ -240,8 +236,9 @@ impl Inner {
         servers::routes(cfg.in_use(), usable)
     }
 
-    fn tor_use_value(&self) -> Value {
-        json!({"torUse": self.mode(), "torUseChosen": self.store.tor_use_chosen, "torUseMigrated": self.store.tor_use_migrated})
+    fn tor_use_value(&self, net: ZNetwork) -> Value {
+        let cfg = self.cfg(net);
+        json!({"torUse": cfg.tor_use, "torUseChosen": cfg.tor_use_chosen, "torUseMigrated": cfg.tor_use_migrated})
     }
 
     fn forget_stale_health(&mut self, net: ZNetwork) {
@@ -281,7 +278,7 @@ impl Inner {
             mempool: r.mempool,
             tip: r.tip,
             direct: direct_urls(reach, cfg.in_use()),
-            tor_use: self.mode(),
+            tor_use: cfg.tor_use,
             direct_for: direct_for(mode),
         };
         serde_json::to_string(&table).unwrap_or_else(reply::err)
@@ -312,7 +309,7 @@ impl Inner {
             mempool: local.clone(),
             tip: local,
             direct: vec![],
-            tor_use: self.mode(),
+            tor_use: cfg.tor_use,
             direct_for: vec![],
         };
         serde_json::to_string(&table).unwrap_or_else(reply::err)
@@ -356,7 +353,7 @@ impl Inner {
             "servers": servers,
             "tor": tor,
         });
-        if let (Value::Object(m), Value::Object(t)) = (&mut v, self.tor_use_value()) {
+        if let (Value::Object(m), Value::Object(t)) = (&mut v, self.tor_use_value(net)) {
             m.extend(t);
         }
         v
@@ -510,14 +507,22 @@ impl Node {
         networks().into_iter().any(|n| inner.watching(n) && inner.uses_built_in_tor(inner.cfg(n)))
     }
 
-    /// `{ ok, torUse, torUseChosen, torUseMigrated }`.
-    pub fn tor_use(&self) -> String {
-        reply::ok(self.lock().tor_use_value())
+    /// `{ ok, network, torUse, torUseChosen, torUseMigrated }`.
+    pub fn tor_use(&self, network: &str) -> String {
+        let Some(net) = ZNetwork::parse(network) else { return bad_network() };
+        let inner = self.lock();
+        if !inner.store.networks.contains_key(&net) {
+            return bad_network();
+        }
+        let mut v = inner.tor_use_value(net);
+        v["network"] = json!(net.name());
+        reply::ok(v)
     }
 
-    /// What goes through Tor on every network, refused while a wallet is open. A mode that
-    /// uses Tor gives each network without one the built-in Tor.
-    pub fn set_tor_use(&self, mode: &str) -> String {
+    /// What goes through Tor on `network`, refused while a wallet is open. A mode that uses Tor
+    /// gives the network the built-in Tor when it has none.
+    pub fn set_tor_use(&self, network: &str, mode: &str) -> String {
+        let Some(net) = ZNetwork::parse(network) else { return bad_network() };
         let Some(mode) = TorUse::parse(mode) else { return reply::err("mode must be all, identifying or none") };
         let (out, events) = {
             let mut inner = self.lock();
@@ -525,11 +530,10 @@ impl Node {
                 return reply::err(LOCKED);
             }
             let mut store = inner.store.clone();
-            (store.tor_use, store.tor_use_chosen) = (mode, true);
-            for (_, cfg) in store.networks.iter_mut().filter(|(n, _)| mode != TorUse::None && **n != ZNetwork::Regtest) {
-                if !cfg.proxy.as_deref().is_some_and(proxy::is_tor) {
-                    (cfg.proxy, cfg.proxy_required) = (Some(BUILT_IN.into()), true);
-                }
+            let Some(cfg) = store.networks.get_mut(&net) else { return bad_network() };
+            (cfg.tor_use, cfg.tor_use_chosen) = (mode, true);
+            if mode != TorUse::None && net != ZNetwork::Regtest && !cfg.proxy.as_deref().is_some_and(proxy::is_tor) {
+                (cfg.proxy, cfg.proxy_required) = (Some(BUILT_IN.into()), true);
             }
             if let Some(p) = &self.path {
                 if let Err(e) = store.save(p) {
@@ -537,8 +541,10 @@ impl Node {
                 }
             }
             inner.store = store;
-            let events: Vec<Event> = networks().into_iter().flat_map(|n| inner.changes(n)).collect();
-            (reply::ok(inner.tor_use_value()), events)
+            let events = inner.changes(net);
+            let mut v = inner.tor_use_value(net);
+            v["network"] = json!(net.name());
+            (reply::ok(v), events)
         };
         self.wake.notify_one();
         self.emit(events);
@@ -823,6 +829,12 @@ mod tests {
         }
     }
 
+
+    /// Sets `mode` on both public networks, as the one setting did before; the last reply.
+    fn tor_everywhere(node: &Node, mode: &str) -> String {
+        node.set_tor_use("mainnet", mode);
+        node.set_tor_use("testnet", mode)
+    }
     fn v(s: String) -> Value {
         serde_json::from_str(&s).unwrap()
     }
@@ -950,7 +962,7 @@ mod tests {
     fn lan_servers_and_tor_per_server() {
         let h = harness();
         // Per-server Tor switches apply when everything goes through Tor.
-        assert_eq!(v(h.node.set_tor_use("all"))["torUse"], "all");
+        assert_eq!(v(tor_everywhere(&h.node, "all"))["torUse"], "all");
         // A node on the user's network, typed as an address: dialled directly, so no proxy is needed.
         let s = v(h.node.set_servers("testnet", r#"[{"id":"home","url":"192.168.1.20","operator":"me"}]"#));
         assert_eq!(s["servers"][0]["url"], "http://192.168.1.20:9067");
@@ -1225,7 +1237,7 @@ mod tests {
     #[test]
     fn identifying_syncs_directly_and_looks_up_over_tor() {
         let h = harness();
-        assert_eq!(v(h.node.tor_use()), json!({"ok": true, "torUse": "identifying", "torUseChosen": false, "torUseMigrated": false}));
+        assert_eq!(v(h.node.tor_use("mainnet")), json!({"ok": true, "network": "mainnet", "torUse": "identifying", "torUseChosen": false, "torUseMigrated": false}));
         let rt = v(h.node.route_table("mainnet"));
         assert_eq!((&rt["torUse"], &rt["directFor"], &rt["proxy"]), (&json!("identifying"), &json!(["sync", "tip"]), &json!(BUILT_IN)));
         assert_eq!(ids(&rt, "sync"), ["zec.rocks", "us.zec.stardust.rest"]);
@@ -1237,13 +1249,13 @@ mod tests {
         assert_eq!(v(h.node.route_table("mainnet"))["direct"], json!([]));
         let (targets, _) = h.node.poll_plan();
         assert!(targets.iter().all(|t| t.proxy == BUILT_IN), "checks go through Tor");
-        h.node.set_tor_use("all");
+        tor_everywhere(&h.node, "all");
         let rt = v(h.node.route_table("mainnet"));
         assert_eq!((&rt["directFor"], &rt["direct"]), (&json!([]), &json!(["https://zec.rocks:443"])));
         // Health says what the wallet uses Tor for, and that the user chose it.
         let health = v(h.node.server_health("mainnet"));
         assert_eq!((&health["torUse"], &health["torUseChosen"], &health["torUseMigrated"]), (&json!("all"), &json!(true), &json!(false)));
-        assert_eq!(v(h.node.set_tor_use("some"))["error"], "mode must be all, identifying or none");
+        assert_eq!(v(tor_everywhere(&h.node, "some"))["error"], "mode must be all, identifying or none");
     }
 
     #[test]
@@ -1254,7 +1266,7 @@ mod tests {
                           {"id": "home", "url": "http://192.168.1.20:9067", "operator": "me"},
                           {"id": "onion", "url": onion, "operator": "them"}]);
         h.node.set_servers("testnet", &list.to_string());
-        assert_eq!(v(h.node.set_tor_use("none"))["torUse"], "none");
+        assert_eq!(v(tor_everywhere(&h.node, "none"))["torUse"], "none");
         assert!(h.take().contains(&"routes testnet".to_string()));
         let rt = v(h.node.route_table("testnet"));
         assert_eq!((&rt["proxy"], &rt["direct"], &rt["directFor"]), (&json!(DIRECT), &json!(["https://testnet.zec.rocks:443"]), &json!([])));
@@ -1281,19 +1293,22 @@ mod tests {
     fn tor_use_is_locked_while_a_wallet_is_open() {
         let h = harness();
         assert_eq!(v(h.node.set_wallet_open("testnet", true))["walletOpen"], true);
-        assert_eq!(v(h.node.set_tor_use("none"))["error"], LOCKED);
-        assert_eq!(v(h.node.tor_use())["torUseChosen"], false);
+        assert_eq!(v(h.node.set_tor_use("mainnet", "none"))["error"], LOCKED);
+        assert_eq!(v(h.node.tor_use("mainnet"))["torUseChosen"], false);
         h.node.set_wallet_open("testnet", false);
-        assert_eq!(v(h.node.set_tor_use("none"))["ok"], true);
-        // A mode that uses Tor gives every network without one the built-in Tor, and it persists.
+        assert_eq!(v(h.node.set_tor_use("testnet", "none"))["ok"], true);
+        // A mode that uses Tor gives that network the built-in Tor when it has none, and it
+        // persists; the other network keeps its own, and is still to be asked.
         h.node.set_proxy("mainnet", r#"{"proxy":"direct","proxyRequired":false}"#);
-        h.node.set_proxy("testnet", r#"{"proxy":"socks5h://127.0.0.1:9150"}"#);
-        assert_eq!(v(h.node.set_tor_use("identifying"))["torUseChosen"], true);
-        assert_eq!((v(h.node.servers("mainnet"))["proxy"].as_str(), v(h.node.servers("testnet"))["proxy"].as_str()), (Some(BUILT_IN), Some("socks5h://127.0.0.1:9150")));
+        h.node.set_proxy("testnet", r#"{"proxy":"direct","proxyRequired":false}"#);
+        assert_eq!(v(h.node.set_tor_use("mainnet", "identifying"))["torUseChosen"], true);
+        assert_eq!((v(h.node.servers("mainnet"))["proxy"].as_str(), v(h.node.servers("testnet"))["proxy"].as_str()), (Some(BUILT_IN), Some(DIRECT)));
         let again = Node::open(Some(h._dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
-        assert_eq!(v(again.tor_use()), json!({"ok": true, "torUse": "identifying", "torUseChosen": true, "torUseMigrated": false}));
+        assert_eq!(v(again.tor_use("mainnet")), json!({"ok": true, "network": "mainnet", "torUse": "identifying", "torUseChosen": true, "torUseMigrated": false}));
+        assert_eq!(v(again.tor_use("testnet")), json!({"ok": true, "network": "testnet", "torUse": "none", "torUseChosen": true, "torUseMigrated": false}));
+        assert_eq!(v(again.tor_use("moonnet"))["ok"], false);
         // The lock lives in memory: a node that starts again starts with no wallet open.
-        assert_eq!(v(again.set_tor_use("all"))["ok"], true);
+        assert_eq!(v(again.set_tor_use("testnet", "all"))["ok"], true);
         assert_eq!(v(h.node.set_wallet_open("moonnet", true))["ok"], false);
     }
 
@@ -1334,13 +1349,13 @@ mod tests {
         let list = json!([{"id": "testnet.zec.rocks", "url": "https://testnet.zec.rocks:443", "operator": "zec.rocks", "direct": true},
                           {"id": "home", "url": "http://192.168.1.20:9067", "operator": "me"},
                           {"id": "onion", "url": onion, "operator": "them"}]);
-        h.node.set_tor_use("all");
+        tor_everywhere(&h.node, "all");
         assert_eq!(v(h.node.set_servers("testnet", &list.to_string()))["ok"], true);
         h.node.set_local_node("testnet", true);
         h.node.watch("testnet");
         assert_eq!(v(h.node.servers("testnet"))["localSends"], "servers");
         for mode in ["all", "identifying", "none"] {
-            h.node.set_tor_use(mode);
+            tor_everywhere(&h.node, mode);
             let rt = v(h.node.route_table("testnet"));
             // Broadcasts, the check that follows one, and the cross-check every 120 s: all through
             // the proxy, with no server and no class reached directly.
@@ -1378,7 +1393,7 @@ mod tests {
         h.node.set_local_node("testnet", true);
         assert_eq!(v(h.node.set_local_sends("testnet", "node"))["localSends"], "node");
         for mode in ["all", "identifying", "none"] {
-            h.node.set_tor_use(mode);
+            tor_everywhere(&h.node, mode);
             let rt = v(h.node.route_table("testnet"));
             for class in ["sync", "details", "taddr", "broadcast", "mempool", "tip"] {
                 assert_eq!(ids(&rt, class), ["local"], "{mode} {class}");
@@ -1414,7 +1429,7 @@ mod tests {
         let s = v(h.node.set_own_server("testnet", r#"{"url":"192.168.1.20"}"#));
         assert_eq!((&s["own"]["url"], &s["chainSource"]), (&json!("http://192.168.1.20:9067"), &json!("own")));
         for mode in ["all", "identifying", "none"] {
-            h.node.set_tor_use(mode);
+            tor_everywhere(&h.node, mode);
             let rt = v(h.node.route_table("testnet"));
             assert!(every(&rt), "{mode}: {rt}");
             assert_eq!((&rt["crossCheck"], &rt["directFor"]), (&json!(false), &json!([])), "{mode}");
@@ -1425,7 +1440,7 @@ mod tests {
         let s = v(h.node.set_own_server("testnet", r#"{"url":"node.example.com:9067","label":"Mine"}"#));
         assert_eq!((&s["own"]["url"], &s["own"]["direct"], &s["own"]["label"]), (&json!("https://node.example.com:9067"), &json!(false), &json!("Mine")));
         for mode in ["all", "identifying", "none"] {
-            h.node.set_tor_use(mode);
+            tor_everywhere(&h.node, mode);
             let rt = v(h.node.route_table("testnet"));
             assert!(every(&rt), "{mode}");
             assert_eq!((&rt["proxy"], &rt["direct"], &rt["directFor"]), (&json!(BUILT_IN), &json!([]), &json!([])), "{mode}");
@@ -1435,7 +1450,7 @@ mod tests {
         // Its switch off: directly, whatever Use Tor for says.
         h.node.set_own_server("testnet", r#"{"url":"https://node.example.com:9067","tor":false}"#);
         for mode in ["all", "identifying", "none"] {
-            h.node.set_tor_use(mode);
+            tor_everywhere(&h.node, mode);
             let rt = v(h.node.route_table("testnet"));
             assert_eq!((&rt["direct"], &rt["directFor"]), (&json!(["https://node.example.com:9067"]), &json!([])), "{mode}");
             assert_eq!(testnet_plan(&h.node), (pairs(&[("own", DIRECT)]), vec![]), "{mode}");
@@ -1454,7 +1469,7 @@ mod tests {
         assert_eq!(v(h.node.set_own_server("testnet", r#"{"url":"http://node.example.com"}"#))["ok"], false);
         assert_eq!(v(h.node.set_servers("testnet", r#"[{"id":"own","url":"https://a.example","operator":"a"}]"#))["ok"], false);
         // Public sources bring the list back untouched; the address is kept for later.
-        h.node.set_tor_use("identifying");
+        tor_everywhere(&h.node, "identifying");
         assert_eq!(v(h.node.set_chain_source("testnet", "public"))["chainSource"], "public");
         let back = v(h.node.servers("testnet"));
         assert_eq!((&back["servers"], back["own"]["url"].as_str()), (&list, Some(onion.as_str())));

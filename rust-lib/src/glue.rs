@@ -58,10 +58,10 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// it keeps the built-in Tor asked. Until a backend calls this, every network is.
     /// `{ ok, watching }`. Backend only.
     fn watch(&self, network: String) -> String;
-    /// `{ ok, torUse, torUseChosen, torUseMigrated }`: what goes through Tor, on every network.
-    fn tor_use(&self) -> String;
-    /// `all`, `identifying` or `none`; refused while a wallet is open. Backend only.
-    fn set_tor_use(&self, mode: String) -> String;
+    /// `{ ok, network, torUse, torUseChosen, torUseMigrated }`: what goes through Tor on `network`.
+    fn tor_use(&self, network: String) -> String;
+    /// `all`, `identifying` or `none` for `network`; refused while a wallet is open. Backend only.
+    fn set_tor_use(&self, network: String, mode: String) -> String;
     /// Whether a wallet is open on `network`, which locks torUse. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
 
@@ -165,12 +165,12 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         self.gated(Access::Backend, |n| n.watch(&network))
     }
 
-    fn tor_use(&self) -> String {
-        self.gated(Access::Open, |n| n.tor_use())
+    fn tor_use(&self, network: String) -> String {
+        self.gated(Access::Open, |n| n.tor_use(&network))
     }
 
-    fn set_tor_use(&self, mode: String) -> String {
-        self.gated(Access::Backend, |n| n.set_tor_use(&mode))
+    fn set_tor_use(&self, network: String, mode: String) -> String {
+        self.gated(Access::Backend, |n| n.set_tor_use(&network, &mode))
     }
 
     fn set_wallet_open(&self, network: String, open: bool) -> String {
