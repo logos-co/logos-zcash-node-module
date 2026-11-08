@@ -28,7 +28,7 @@ the user's Tor choices, and a `custom` list gets the host switched off.
 
 ## Use Tor for
 
-One setting for every network, `set_tor_use(mode)`:
+One setting per network, `set_tor_use(network, mode)`:
 
 | Mode | Direct | Through Tor |
 |---|---|---|
@@ -41,16 +41,18 @@ One setting for every network, `set_tor_use(mode)`:
   Tor. In `none`, `direct` lists every enabled https server and the proxy is `direct`.
 - An onion service goes through Tor in every mode, and a server on the user's network is
   direct in every mode. The per-server Tor switch applies to `all` only.
-- `identifying` and `all` need a Tor: setting either gives each network without one the
-  built-in Tor. Which Tor stays per network (`set_proxy`).
-- `tor_use()` and `server_health` answer `{ torUse, torUseChosen, torUseMigrated }`.
-  `torUseChosen` turns true at the first `set_tor_use`; until then the app asks.
+- `identifying` and `all` need a Tor: setting either gives that network the built-in Tor when it
+  has none. Which Tor is set with `set_proxy`.
+- `tor_use(network)` and `server_health` answer `{ torUse, torUseChosen, torUseMigrated }`.
+  `torUseChosen` turns true at that network's first `set_tor_use`; until then the app asks.
 - Refused while a wallet is open: the backend reports it with `set_wallet_open(network, open)`.
 
-A fresh file starts at `identifying`. A file from before the setting (version 1 or 2) keeps its
-routing: `all` if any network has a Tor proxy, else `none`, with `torUseMigrated` true and
-`torUseChosen` false, so the app asks once with today's routing preselected. An older build
-sets a version 3 file aside as corrupt and seeds the presets.
+A fresh file starts at `identifying` on every network. A file from before the setting (version 1
+or 2) keeps its routing: `all` if any network has a Tor proxy, else `none`, with
+`torUseMigrated` true and `torUseChosen` false, so the app asks with today's routing
+preselected. A version 3 file kept one setting for every network: each network gets it, not
+chosen, and preselected when it had been chosen or migrated. An older build sets a version 4
+file aside as corrupt and seeds the presets.
 
 ## Where the chain comes from
 
