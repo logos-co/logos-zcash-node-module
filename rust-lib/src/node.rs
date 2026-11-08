@@ -140,7 +140,6 @@ fn direct_for(mode: TorUse) -> Vec<CallClass> {
 pub enum Event {
     HealthChanged { network: ZNetwork, payload: String },
     RoutesChanged { network: ZNetwork },
-    Suspect { network: ZNetwork, server_id: String, kind: String },
 }
 
 pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
@@ -680,23 +679,8 @@ impl Node {
         reply::ok(self.lock().health_value(net))
     }
 
-    pub fn report_mismatch(&self, network: &str, server_id: &str, kind: &str, height: i64) -> String {
-        let Some(net) = ZNetwork::parse(network) else { return bad_network() };
-        if kind.trim().is_empty() || kind.chars().count() > 64 || kind.chars().any(char::is_control) {
-            return reply::err("kind must be 1 to 64 printable characters");
-        }
-        let Ok(height) = u64::try_from(height) else { return reply::err("height must not be negative") };
-        self.mutate(net, false, |cfg| {
-            if cfg.server(server_id).is_none() {
-                return Err(format!("unknown server {server_id}"));
-            }
-            cfg.suspects.insert(server_id.into(), Suspicion { kind: kind.into(), height, at: now() });
-            let out = json!({"network": net.name(), "serverId": server_id, "suspect": true, "kind": kind, "height": height});
-            let first = Event::Suspect { network: net, server_id: server_id.into(), kind: kind.into() };
-            Ok((reply::ok(out), vec![first]))
-        })
-    }
-
+    /// Nothing marks a server suspect any more (`report_mismatch` had no caller); this stays while
+    /// the backend and CLI call it. Tests mark suspects with `mark_suspect`.
     pub fn clear_suspect(&self, network: &str, server_id: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
         self.mutate(net, false, |cfg| {
@@ -706,6 +690,15 @@ impl Node {
             let cleared = cfg.suspects.remove(server_id).is_some();
             Ok((reply::ok(json!({"network": net.name(), "serverId": server_id, "cleared": cleared})), vec![]))
         })
+    }
+
+    #[cfg(test)]
+    fn mark_suspect(&self, network: &str, server_id: &str, kind: &str, height: u64) {
+        let net = ZNetwork::parse(network).unwrap();
+        self.mutate(net, false, |cfg| {
+            cfg.suspects.insert(server_id.into(), Suspicion { kind: kind.into(), height, at: now() });
+            Ok((reply::ok(json!({})), vec![]))
+        });
     }
 
     /// Installed by the glue when zebrad_module is a dependency.
@@ -852,7 +845,6 @@ mod tests {
                     format!("health {} {}", network.name(), v["overall"].as_str().unwrap())
                 }
                 Event::RoutesChanged { network } => format!("routes {}", network.name()),
-                Event::Suspect { network, server_id, kind } => format!("suspect {} {server_id} {kind}", network.name()),
             };
             log.lock().unwrap().push(line);
         });
@@ -912,7 +904,7 @@ mod tests {
         assert_eq!(v(h.node.servers("testnet"))["localNode"], true);
         // Suspect servers leave no broadcast route; the local node does not quietly take over.
         for id in &broadcast {
-            h.node.report_mismatch("testnet", id, "tip", 1);
+            h.node.mark_suspect("testnet", id, "tip", 1);
         }
         assert_eq!(v(h.node.route_table("testnet"))["broadcast"], json!([]));
         // Status comes from zebrad_module; it must run this network to be available.
@@ -1128,15 +1120,11 @@ mod tests {
         assert!(h.take().is_empty());
 
         // A suspect leaves the routes and degrades health.
-        assert_eq!(v(h.node.report_mismatch("mainnet", "zec.rocks", "tree_state", 3_499_990))["suspect"], true);
-        assert_eq!(h.take(), ["suspect mainnet zec.rocks tree_state", "routes mainnet", "health mainnet degraded"]);
+        h.node.mark_suspect("mainnet", "zec.rocks", "tree_state", 3_499_990);
+        assert_eq!(h.take(), ["routes mainnet", "health mainnet degraded"]);
         let rt = v(h.node.route_table("mainnet"));
         assert_eq!((ids(&rt, "sync"), &rt["crossCheck"]), (vec!["us.zec.stardust.rest".to_string()], &json!(false)));
         assert_eq!(v(h.node.server_health("mainnet"))["servers"][0]["suspectKind"], "tree_state");
-        assert_eq!(v(h.node.report_mismatch("mainnet", "nope", "x", 1))["error"], "unknown server nope");
-        assert_eq!(v(h.node.report_mismatch("mainnet", "zec.rocks", "", 1))["ok"], false);
-        assert_eq!(v(h.node.report_mismatch("mainnet", "zec.rocks", "a\nb", 1))["ok"], false);
-        assert_eq!(v(h.node.report_mismatch("mainnet", "zec.rocks", "x", -1))["ok"], false);
 
         assert_eq!(v(h.node.clear_suspect("mainnet", "zec.rocks"))["cleared"], true);
         assert_eq!(h.take(), ["routes mainnet", "health mainnet ok"]);
@@ -1182,7 +1170,7 @@ mod tests {
         assert_eq!((&stardust["enabled"], &stardust["checkedAt"]), (&json!(false), &Value::Null));
 
         h.node.set_proxy("testnet", r#"{"proxy":"socks5h://127.0.0.1:19050","proxyRequired":true}"#);
-        h.node.report_mismatch("mainnet", "zec.rocks", "block_hash", 10);
+        h.node.mark_suspect("mainnet", "zec.rocks", "block_hash", 10);
         let path = h._dir.path().join(crate::store::FILE_NAME);
         let again = Node::open(Some(path), Arc::new(|_| {}));
         again.set_tor(tor_view("ready"));

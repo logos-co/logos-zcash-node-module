@@ -36,8 +36,6 @@ pub trait ZcashNodeModule: Send + Sync + 'static {
     /// tor, torUse, torUseChosen, torUseMigrated }`; `tor` is the built-in Tor's `{ state,
     /// progress, detail }` when the network uses it, else null.
     fn server_health(&self, network: String) -> String;
-    /// Marks a server suspect until the backend clears it. Backend and wallet core.
-    fn report_mismatch(&self, network: String, server_id: String, kind: String, height: i64) -> String;
     /// `{ ok, network, serverId, cleared }`. Backend only.
     fn clear_suspect(&self, network: String, server_id: String) -> String;
     /// `{ ok, enabled, available, status?, error? }`: whether reads go to the local node, and
@@ -75,7 +73,6 @@ pub trait ZcashNodeModuleEvents {
     fn server_health_changed(&self, network: String, payload: String);
     /// route_table(network) would now answer differently.
     fn routes_changed(&self, network: String);
-    fn server_suspect(&self, network: String, server_id: String, kind: String);
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
@@ -134,10 +131,6 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         self.gated(Access::Open, |n| n.server_health(&network))
     }
 
-    fn report_mismatch(&self, network: String, server_id: String, kind: String, height: i64) -> String {
-        self.gated(Access::BackendOrCore, |n| n.report_mismatch(&network, &server_id, &kind, height))
-    }
-
     fn clear_suspect(&self, network: String, server_id: String) -> String {
         self.gated(Access::Backend, |n| n.clear_suspect(&network, &server_id))
     }
@@ -193,7 +186,6 @@ impl ZcashNodeModule for ZcashNodeModuleImpl {
         let sink: Sink = Arc::new(|ev| match ev {
             Event::HealthChanged { network, payload } => emit_server_health_changed(network.name(), &payload),
             Event::RoutesChanged { network } => emit_routes_changed(network.name()),
-            Event::Suspect { network, server_id, kind } => emit_server_suspect(network.name(), &server_id, &kind),
         });
         let node = Node::open(Some(dir.join(FILE_NAME)), sink);
         node.set_local_status(Arc::new(ZebradStatus::default()));

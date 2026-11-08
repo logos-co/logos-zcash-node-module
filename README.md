@@ -147,8 +147,9 @@ Regtest has no presets and starts with no servers and no proxy. Its lightwalletd
 
 Only `zcash_wallet_backend` may change the list, the preset, the proxy or what Tor is used
 for, clear a suspect server, or say which network a wallet is open on or watched. The backend and `zcash_wallet_core_module`
-may read routes and report a mismatch, which marks a server suspect until the backend clears
-it. Events: `server_health_changed`, `routes_changed`, `server_suspect`.
+may read routes. Nothing marks a server suspect: `report_mismatch` had no caller and is gone,
+and the wallet core checks servers itself (chunks that must fit, the cross-check). Events:
+`server_health_changed`, `routes_changed`.
 
 ```bash
 cd rust-lib && cargo test --no-default-features
