@@ -16,7 +16,7 @@ use crate::network::{networks, ZNetwork};
 use crate::proxy::{self, BUILT_IN, DIRECT};
 use crate::reply;
 use crate::servers::{self, CallClass, Preset, Route, Server};
-use crate::store::{ChainSource, LocalSends, NetConfig, Store, Suspicion, TorUse};
+use crate::store::{ChainSource, LocalSends, NetConfig, Store, Suspicion, TorUse, OWN_ID};
 
 pub const NO_PROXY: &str = "no proxy is set";
 /// An onion service while the wallet uses Tor for nothing.
@@ -27,8 +27,8 @@ pub const LOCKED: &str = "close the wallet to change this";
 /// user's own Tor as a socks5h URL, `direct`, or nothing.
 type Dial = Option<String>;
 
-/// What a network's servers go through. Public servers follow Use Tor for. The servers that
-/// send for the local node take Tor whatever it says; the user's own server, its own switch.
+/// What a server goes through. Public servers follow Use Tor for. The servers that send for
+/// your own node take Tor whatever it says; the user's own server, its own switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reach {
     mode: TorUse,
@@ -99,14 +99,34 @@ impl TorView {
     }
 }
 
+/// Reached through Tor as `cfg`'s chain source says for `s`.
+fn reach(cfg: &NetConfig, s: &Server) -> Reach {
+    match cfg.chain_source() {
+        ChainSource::Public => Reach { mode: cfg.tor_use, per_server: true },
+        ChainSource::Own if s.id == OWN_ID => Reach { mode: TorUse::All, per_server: true },
+        _ => Reach { mode: TorUse::All, per_server: false },
+    }
+}
+
+/// Use Tor for applies to public servers only.
+fn tor_mode(cfg: &NetConfig) -> TorUse {
+    match cfg.chain_source() {
+        ChainSource::Public => cfg.tor_use,
+        _ => TorUse::All,
+    }
+}
+
 /// The enabled servers the wallet core reaches without Tor: every https one with Tor for
 /// nothing, the ones the user set to skip it with Tor for everything, else none.
-fn direct_urls(reach: Reach, servers: &[Server]) -> Vec<String> {
-    let direct = |s: &Server| match reach.mode {
-        TorUse::None => s.url.starts_with("https://"),
-        _ => reach.skips_tor(s),
+fn direct_urls<'a>(cfg: &NetConfig, servers: impl IntoIterator<Item = &'a Server>) -> Vec<String> {
+    let direct = |s: &Server| {
+        let r = reach(cfg, s);
+        match r.mode {
+            TorUse::None => s.url.starts_with("https://"),
+            _ => r.skips_tor(s),
+        }
     };
-    servers.iter().filter(|s| s.enabled && direct(s)).map(|s| s.url.clone()).collect()
+    servers.into_iter().filter(|s| s.enabled && direct(s)).map(|s| s.url.clone()).collect()
 }
 
 /// The classes the wallet core dials directly, every other one through Tor.
@@ -215,24 +235,15 @@ impl Inner {
         cfg.proxy.clone()
     }
 
-    /// Use Tor for applies to public servers only.
-    fn reach(&self, cfg: &NetConfig) -> Reach {
-        match cfg.chain_source() {
-            ChainSource::Public => Reach { mode: cfg.tor_use, per_server: true },
-            ChainSource::Local => Reach { mode: TorUse::All, per_server: false },
-            ChainSource::Own => Reach { mode: TorUse::All, per_server: true },
-        }
-    }
-
-    fn usable_routes(&self, net: ZNetwork) -> servers::Routes {
+    fn usable_routes(&self, net: ZNetwork, list: &[Server]) -> servers::Routes {
         let cfg = self.cfg(net);
-        let (dial, reach) = (self.dial(cfg), self.reach(cfg));
+        let dial = self.dial(cfg);
         let usable = |s: &Server| {
-            blocked(reach, &dial, s).is_none()
+            blocked(reach(cfg, s), &dial, s).is_none()
                 && !cfg.suspects.contains_key(&s.id)
                 && !self.health_of(net, s).is_some_and(|h| h.incompatible)
         };
-        servers::routes(cfg.in_use(), usable)
+        servers::routes(list, usable)
     }
 
     fn tor_use_value(&self, net: ZNetwork) -> Value {
@@ -251,12 +262,14 @@ impl Inner {
     /// proxy, that leaves the servers on the user's network, which need none.
     fn route_table(&self, net: ZNetwork) -> String {
         let cfg = self.cfg(net);
-        let (dial, reach) = (self.dial(cfg), self.reach(cfg));
-        let mode = reach.mode;
-        let r = self.usable_routes(net);
-        if cfg.local_node {
-            return self.local_route_table(net, cfg, r.broadcast, &dial);
-        }
+        let (dial, mode) = (self.dial(cfg), tor_mode(cfg));
+        let list = match (cfg.chain_source(), &cfg.own) {
+            (ChainSource::Local, _) => return self.local_route_table(net, cfg, &dial),
+            (ChainSource::Own, Some(own)) if !cfg.senders().is_empty() => return self.own_server_route_table(net, cfg, own, &dial),
+            (ChainSource::Own, Some(own)) => std::slice::from_ref(own),
+            _ => &cfg.servers,
+        };
+        let r = self.usable_routes(net, list);
         let proxy = match &dial {
             _ if mode == TorUse::None && !r.sync.is_empty() => DIRECT,
             _ if mode == TorUse::None => return reply::err(TOR_OFF),
@@ -276,7 +289,7 @@ impl Inner {
             broadcast: r.broadcast,
             mempool: r.mempool,
             tip: r.tip,
-            direct: direct_urls(reach, cfg.in_use()),
+            direct: direct_urls(cfg, list),
             tor_use: cfg.tor_use,
             direct_for: direct_for(mode),
         };
@@ -286,9 +299,10 @@ impl Inner {
     /// Every read from the local node, which checks the chain itself, so nothing is cross-checked.
     /// Sends go through the servers over Tor whatever Use Tor for says, even when none is usable
     /// right now, or through the node alone when the user chose that or enabled no server.
-    fn local_route_table(&self, net: ZNetwork, cfg: &NetConfig, remote: Vec<Route>, dial: &Dial) -> String {
+    fn local_route_table(&self, net: ZNetwork, cfg: &NetConfig, dial: &Dial) -> String {
         let local = vec![Route { id: "local".into(), url: LOCAL_NODE_URL.into(), operator: "local".into() }];
-        let senders: Vec<&Server> = cfg.in_use().iter().filter(|s| s.enabled && s.classes.contains(&CallClass::Broadcast)).collect();
+        let senders = cfg.senders();
+        let remote = self.usable_routes(net, &cfg.servers).broadcast;
         let (broadcast, proxy) = match dial {
             _ if senders.is_empty() => (local.clone(), ""),
             Some(p) => (remote, p.as_str()),
@@ -314,11 +328,40 @@ impl Inner {
         serde_json::to_string(&table).unwrap_or_else(reply::err)
     }
 
+    /// Every read from the user's own server, as its own switch says, with nothing cross-checked.
+    /// Sends go through the servers over Tor whatever Use Tor for says, even when none is usable
+    /// right now. With no Tor, only servers on the user's network send, as with the local node.
+    fn own_server_route_table(&self, net: ZNetwork, cfg: &NetConfig, own: &Server, dial: &Dial) -> String {
+        let reads = self.usable_routes(net, std::slice::from_ref(own));
+        let proxy = match dial {
+            Some(p) => p.as_str(),
+            None if !reads.sync.is_empty() && cfg.senders().iter().any(|s| is_lan_url(&s.url)) => DIRECT,
+            None => return reply::err(NO_PROXY),
+        };
+        let table = RouteTable {
+            ok: true,
+            network: net.name(),
+            proxy,
+            proxy_required: cfg.proxy_required && proxy != DIRECT,
+            cross_check: false,
+            sync: reads.sync,
+            details: reads.details,
+            taddr: reads.taddr,
+            broadcast: self.usable_routes(net, &cfg.servers).broadcast,
+            mempool: reads.mempool,
+            tip: reads.tip,
+            direct: direct_urls(cfg, [own]),
+            tor_use: cfg.tor_use,
+            direct_for: vec![],
+        };
+        serde_json::to_string(&table).unwrap_or_else(reply::err)
+    }
+
     /// server_health()'s fields, without `ok`.
     fn health_value(&self, net: ZNetwork) -> Value {
         let cfg = self.cfg(net);
         let seen: Vec<(&Server, Option<&ServerHealth>, Option<&Suspicion>)> =
-            cfg.in_use().iter().map(|s| (s, self.health_of(net, s), cfg.suspects.get(&s.id))).collect();
+            cfg.in_use().into_iter().map(|s| (s, self.health_of(net, s), cfg.suspects.get(&s.id))).collect();
         let rows: Vec<Row> = seen
             .iter()
             .map(|(s, h, sus)| Row { operator: &s.operator, enabled: s.enabled, suspect: sus.is_some(), health: *h })
@@ -360,8 +403,7 @@ impl Inner {
 
     /// Some server in use goes through the built-in Tor.
     fn uses_built_in_tor(&self, cfg: &NetConfig) -> bool {
-        let reach = self.reach(cfg);
-        cfg.proxy.as_deref() == Some(BUILT_IN) && cfg.in_use().iter().any(|s| s.enabled && reach.through_tor(s))
+        cfg.proxy.as_deref() == Some(BUILT_IN) && cfg.in_use().into_iter().any(|s| s.enabled && reach(cfg, s).through_tor(s))
     }
 
     /// Events for whatever changed since they were last sent. Round-trip times and
@@ -397,7 +439,8 @@ fn signature(health: &Value) -> String {
 fn servers_reply(net: ZNetwork, cfg: &NetConfig) -> String {
     reply::ok(json!({"network": net.name(), "preset": cfg.preset, "servers": cfg.servers,
                      "proxy": cfg.proxy, "proxyRequired": cfg.proxy_required, "localNode": cfg.local_node,
-                     "chainSource": cfg.chain_source(), "own": cfg.own, "localSends": cfg.local_sends}))
+                     "chainSource": cfg.chain_source(), "own": cfg.own, "localSends": cfg.local_sends,
+                     "localSendsFor": [ChainSource::Local, ChainSource::Own]}))
 }
 
 /// The route the wallet core reaches the local node by, over Logos IPC.
@@ -686,8 +729,8 @@ impl Node {
         })
     }
 
-    /// `{ url, tor, label? }`: the user's own server, which then takes every call; an empty url
-    /// forgets it and goes back to the list. `{ ok, network, own, chainSource }`.
+    /// `{ url, tor, label? }`: the user's own server, which then takes every read, and the sends
+    /// as set_local_sends says; an empty url forgets it and goes back to the list. `{ ok, network, own, chainSource }`.
     pub fn set_own_server(&self, network: &str, config_json: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
         let own = match servers::parse_own(net, config_json) {
@@ -706,8 +749,8 @@ impl Node {
         })
     }
 
-    /// `servers` or `node`: with the local node, sends go through the servers over Tor, or
-    /// through the node, with no server contacted. `{ ok, network, localSends }`.
+    /// `servers` or `node`, for the local node and the user's own server alike: sends go through
+    /// the servers over Tor, or through the node or that server alone. `{ ok, network, localSends }`.
     pub fn set_local_sends(&self, network: &str, via: &str) -> String {
         let Some(net) = ZNetwork::parse(network) else { return bad_network() };
         let Some(via) = LocalSends::parse(via) else { return reply::err("sends go through servers or node") };
@@ -743,9 +786,10 @@ impl Node {
         let inner = self.lock();
         let (mut targets, mut skipped) = (Vec::new(), Vec::new());
         for (net, cfg) in inner.store.networks.iter().filter(|(n, _)| inner.watching(**n)) {
-            let (dial, reach) = (inner.dial(cfg), inner.reach(cfg));
+            let dial = inner.dial(cfg);
             // Checks name nothing, but a direct one would show the lookup operator this IP.
-            for s in cfg.in_use().iter().filter(|s| s.enabled) {
+            for s in cfg.in_use().into_iter().filter(|s| s.enabled) {
+                let reach = reach(cfg, s);
                 let proxy = match &dial {
                     Some(p) if reach.through_tor(s) => p.clone(),
                     _ => DIRECT.into(),
@@ -1410,6 +1454,8 @@ mod tests {
     fn your_own_server_takes_every_call_with_its_own_tor_switch() {
         let h = harness();
         h.node.watch("testnet");
+        // Sending through it: no public server is contacted.
+        assert_eq!(v(h.node.set_local_sends("testnet", "node"))["localSends"], "node");
         let list = v(h.node.servers("testnet"))["servers"].clone();
         assert!(v(h.node.set_chain_source("testnet", "own"))["error"].as_str().unwrap().contains("first"));
         let every = |rt: &Value| ["sync", "details", "taddr", "broadcast", "mempool", "tip"].iter().all(|c| ids(rt, c) == ["own"]);
@@ -1475,6 +1521,65 @@ mod tests {
         let s = v(h.node.set_own_server("testnet", r#"{"url":""}"#));
         assert_eq!((&s["own"], &s["chainSource"]), (&Value::Null, &json!("public")));
         assert_eq!(v(h.node.set_chain_source("testnet", "elsewhere"))["ok"], false);
+    }
+
+    #[test]
+    fn your_own_server_reads_and_the_servers_send_over_tor() {
+        let h = harness();
+        h.node.watch("testnet");
+        // A public server set to skip Tor, one on the user's network, and an onion service.
+        let onion = format!("http://{}.onion:9067", "a2".repeat(28));
+        let list = json!([{"id": "testnet.zec.rocks", "url": "https://testnet.zec.rocks:443", "operator": "zec.rocks", "direct": true},
+                          {"id": "home", "url": "http://192.168.1.20:9067", "operator": "me"},
+                          {"id": "onion", "url": onion, "operator": "them"}]);
+        tor_everywhere(&h.node, "all");
+        assert_eq!(v(h.node.set_servers("testnet", &list.to_string()))["ok"], true);
+        let s = v(h.node.set_own_server("testnet", r#"{"url":"192.168.2.30"}"#));
+        assert_eq!(s["chainSource"], "own");
+        let s = v(h.node.servers("testnet"));
+        assert_eq!((&s["localSends"], &s["localSendsFor"]), (&json!("servers"), &json!(["local", "own"])));
+        let reads = |rt: &Value| ["sync", "details", "taddr", "mempool", "tip"].iter().all(|c| ids(rt, c) == ["own"]);
+        // Reads from your server on your network, directly; sends, their checks and the health
+        // checks through Tor whatever Use Tor for and a server's own switch say.
+        for mode in ["all", "identifying", "none"] {
+            tor_everywhere(&h.node, mode);
+            let rt = v(h.node.route_table("testnet"));
+            assert!(reads(&rt), "{mode}: {rt}");
+            assert_eq!(ids(&rt, "broadcast"), ["testnet.zec.rocks", "home", "onion"], "{mode}");
+            assert_eq!((&rt["proxy"], &rt["direct"], &rt["directFor"], &rt["crossCheck"]),
+                       (&json!(BUILT_IN), &json!([]), &json!([]), &json!(false)), "{mode}");
+            let want = pairs(&[("own", DIRECT), ("testnet.zec.rocks", BUILT_IN), ("home", DIRECT), ("onion", BUILT_IN)]);
+            assert_eq!(testnet_plan(&h.node), (want, vec![]), "{mode}");
+            assert!(h.node.uses_built_in_tor(), "{mode}");
+            let health = v(h.node.server_health("testnet"));
+            assert_eq!(health["servers"].as_array().unwrap().len(), 4, "{mode}");
+        }
+        // Your server on the internet with its switch off: in `direct`, while sends keep Tor.
+        h.node.set_own_server("testnet", r#"{"url":"https://node.example.com:9067","tor":false}"#);
+        let rt = v(h.node.route_table("testnet"));
+        assert!(reads(&rt));
+        assert_eq!((&rt["proxy"], &rt["direct"]), (&json!(BUILT_IN), &json!(["https://node.example.com:9067"])));
+        assert_eq!(testnet_plan(&h.node).0[..2], pairs(&[("own", DIRECT), ("testnet.zec.rocks", BUILT_IN)]));
+        // With no Tor, only the server on the user's network sends, and your server needs its switch off.
+        h.node.set_proxy("testnet", r#"{"proxy":"direct","proxyRequired":false}"#);
+        let rt = v(h.node.route_table("testnet"));
+        assert!(reads(&rt));
+        assert_eq!((ids(&rt, "broadcast"), &rt["proxy"]), (vec!["home".to_string()], &json!(DIRECT)));
+        h.node.set_own_server("testnet", r#"{"url":"https://node.example.com:9067","tor":true}"#);
+        assert_eq!(v(h.node.route_table("testnet"))["sync"], json!([]));
+        h.node.set_proxy("testnet", r#"{"proxy":"tor"}"#);
+        // No server that sends is on: your server sends, as it did before the choice.
+        h.node.set_servers("testnet", r#"[{"id":"a","url":"https://a.example","operator":"x","classes":["sync","tip"]}]"#);
+        let rt = v(h.node.route_table("testnet"));
+        assert_eq!((ids(&rt, "broadcast"), &rt["proxy"]), (vec!["own".to_string()], &json!(BUILT_IN)));
+        assert_eq!(testnet_plan(&h.node).0, pairs(&[("own", BUILT_IN), ("a", BUILT_IN)]));
+        // Through your server: no public server is contacted.
+        h.node.set_servers("testnet", &list.to_string());
+        h.node.set_local_sends("testnet", "node");
+        let rt = v(h.node.route_table("testnet"));
+        assert!(reads(&rt) && ids(&rt, "broadcast") == ["own"]);
+        assert_eq!(testnet_plan(&h.node), (pairs(&[("own", BUILT_IN)]), vec![]));
+        assert_eq!(v(h.node.server_health("testnet"))["servers"].as_array().unwrap().len(), 1);
     }
 
     #[test]
